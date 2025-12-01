@@ -14,10 +14,10 @@ GAME_ID = "109983668079237"  # <-- CHANGE THIS
 
 ROBLOX_API_URL = f"https://games.roblox.com/v1/games/{GAME_ID}/servers/Public?sortOrder=Asc&limit=100"
 
-CACHE_LIMIT = 4000
-CACHE_REFRESH_INTERVAL = 30
-CACHE_LOW_THRESHOLD = 500
-BLACKLIST_DURATION = 300   # 5 minutes blacklist
+CACHE_LIMIT = 50000
+CACHE_REFRESH_INTERVAL = 5
+CACHE_LOW_THRESHOLD = 5000
+BLACKLIST_DURATION = 180   # 5 minutes blacklist
 ROBLOX_TIMEOUT = 10
 CACHE_CLEAR_INTERVAL = 1800  # Clear every 30 min
 # ---------------------------------------
