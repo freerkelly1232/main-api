@@ -30,10 +30,10 @@ CACHE_CLEAR_INTERVAL = 3600      # Clear every 1 hour
 
 # Rate limiting
 MAX_REQUESTS_PER_SECOND = 100    # Max requests per second
-BATCH_SIZE = 500                  # Servers per batch request
+BATCH_SIZE = 100                  # Servers per batch request
 
 # Pagination - fetch multiple pages
-MAX_PAGES_PER_FETCH = 25         # Fetch up to 10 pages (1000 servers) per cycle
+MAX_PAGES_PER_FETCH = 10        # Fetch up to 10 pages (1000 servers) per cycle
 # ---------------------------------------
 
 # Use deque for O(1) popleft operations
