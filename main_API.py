@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-COVERAGE MAIN API v3.0 - STRICT NO OVERLAP
-Every bot gets a unique server. No sharing. Maximum spread.
-"""
-
 from flask import Flask, jsonify, request
 import requests
 import threading
@@ -14,91 +9,58 @@ import random
 
 app = Flask(__name__)
 
-# ================== CONFIG ==================
-GAME_ID = "109983668079237"
-PLACE_IDS = ["109983668079237"]
+# ---------------- CONFIG ----------------
+GAME_ID = "109983668079237"  # Universe ID
 
+# Multiple Place IDs to fetch from (main game + rebirth servers)
+PLACE_IDS = [
+    "109983668079237",  # Main game
+]
+
+# API URLs
 ROBLOX_API_BASE = "https://games.roblox.com/v1/games/{}/servers/Public?sortOrder=Asc&limit=100"
 
-# Cache settings
-CACHE_LIMIT = 100000             # Big cache for unique distribution
-CACHE_REFRESH_INTERVAL = 4       # Fast refresh
-CACHE_LOW_THRESHOLD = 5000
+# Cache settings - Optimized for 300 bots
+CACHE_LIMIT = 50000              # 50k servers max
+CACHE_REFRESH_INTERVAL = 5       # Fetch every 5 seconds
+CACHE_LOW_THRESHOLD = 5000       # Refresh early if below 5k
+BLACKLIST_DURATION = 180         # 3 min blacklist (shorter for more servers)
 ROBLOX_TIMEOUT = 15
+CACHE_CLEAR_INTERVAL = 3600      # Clear every 1 hour
 
-# STRICT BLACKLIST - ensures no overlap
-BLACKLIST_DURATION = 600         # 10 MINUTES - server won't be given to ANY bot
-BOT_BLACKLIST_DURATION = 1800    # 30 MINUTES - bot-specific blacklist
+# Rate limiting
+MAX_REQUESTS_PER_SECOND = 100    # Max requests per second
+BATCH_SIZE = 500                  # Servers per batch request
 
-# Fetch settings
-MAX_PAGES_PER_FETCH = 20         # More pages = more unique servers
-OPTIMAL_PLAYER_RANGE = (2, 7)    # Accept wider range for more options
+# Pagination - fetch multiple pages
+MAX_PAGES_PER_FETCH = 25         # Fetch up to 10 pages (1000 servers) per cycle
+# ---------------------------------------
 
-# ================== DATA ==================
-server_queue = deque(maxlen=CACHE_LIMIT)
-global_blacklist = {}            # {job_id: expiry_time} - NO bot gets these
-bot_blacklist = {}               # {bot_id: {job_id: expiry_time}} - per-bot tracking
+# Use deque for O(1) popleft operations
+server_cache = deque(maxlen=CACHE_LIMIT)
+jobs_assigned = 0
+blacklist = {}
+lock = threading.RLock()  # Reentrant lock for nested calls
 
-lock = threading.RLock()
-
+# Stats tracking
 stats = {
     "total_assigned": 0,
-    "unique_servers": 0,
-    "collisions_prevented": 0,
     "total_fetched": 0,
     "fetch_errors": 0,
     "last_fetch": None,
     "uptime_start": time.time()
 }
 
-# ================== CLEANUP ==================
-def cleanup_global_blacklist():
+def cleanup_blacklist():
+    """Remove expired blacklist entries"""
     now = time.time()
-    expired = [job for job, exp in global_blacklist.items() if exp <= now]
+    expired = [job for job, exp in blacklist.items() if exp <= now]
     for job in expired:
-        del global_blacklist[job]
+        del blacklist[job]
     return len(expired)
 
-def cleanup_bot_blacklist(bot_id):
-    if bot_id not in bot_blacklist:
-        return 0
-    now = time.time()
-    expired = [job for job, exp in bot_blacklist[bot_id].items() if exp <= now]
-    for job in expired:
-        del bot_blacklist[bot_id][job]
-    return len(expired)
-
-def cleanup_all_bot_blacklists():
-    now = time.time()
-    for bot_id in list(bot_blacklist.keys()):
-        expired = [job for job, exp in bot_blacklist[bot_id].items() if exp <= now]
-        for job in expired:
-            del bot_blacklist[bot_id][job]
-        if not bot_blacklist[bot_id]:
-            del bot_blacklist[bot_id]
-
-# ================== SERVER SCORING ==================
-def score_server(server_data):
-    """Simple scoring - just check player count"""
-    players = server_data.get("playing", 0)
-    max_players = server_data.get("maxPlayers", 8)
-    
-    # Skip full servers
-    if players >= max_players:
-        return -1
-    
-    # Skip empty servers
-    if players < 1:
-        return 0
-    
-    # Prefer servers in optimal range
-    if OPTIMAL_PLAYER_RANGE[0] <= players <= OPTIMAL_PLAYER_RANGE[1]:
-        return 100 + random.randint(0, 20)
-    
-    return 50 + random.randint(0, 10)
-
-# ================== FETCH ==================
 def fetch_servers_from_page(place_id, cursor=None):
+    """Fetch a single page of servers"""
     url = ROBLOX_API_BASE.format(place_id)
     if cursor:
         url += f"&cursor={cursor}"
@@ -107,286 +69,306 @@ def fetch_servers_from_page(place_id, cursor=None):
         response = requests.get(url, timeout=ROBLOX_TIMEOUT)
         response.raise_for_status()
         data = response.json()
-        return data.get("data", []), data.get("nextPageCursor")
+        servers = data.get("data", [])
+        
+        # Sort by player count (higher = better, more brainrots)
+        servers.sort(key=lambda x: x.get("playing", 0), reverse=True)
+        
+        return servers, data.get("nextPageCursor")
     except Exception as e:
         stats["fetch_errors"] += 1
+        print(f"[ERROR] Fetch failed: {e}")
         return [], None
 
 def fetch_job_ids():
-    """Main fetch loop"""
+    """Main fetch loop - fetches from multiple pages"""
+    global server_cache
+    
     while True:
         try:
             total_new = 0
             
             for place_id in PLACE_IDS:
                 cursor = None
-                pages = 0
+                pages_fetched = 0
                 
-                while pages < MAX_PAGES_PER_FETCH:
+                while pages_fetched < MAX_PAGES_PER_FETCH:
                     servers, next_cursor = fetch_servers_from_page(place_id, cursor)
                     
                     if not servers:
                         break
                     
                     with lock:
-                        cleanup_global_blacklist()
-                        existing = set(server_queue) | set(global_blacklist.keys())
+                        cleanup_blacklist()
+                        existing = set(server_cache) | set(blacklist.keys())
                         
-                        # Score and sort servers
-                        scored = []
+                        new_jobs = []
                         for s in servers:
                             job_id = s.get("id")
-                            if not job_id or job_id in existing:
-                                continue
-                            score = score_server(s)
-                            if score > 0:
-                                scored.append((score, job_id))
+                            players = s.get("playing", 0)
+                            # Prioritize servers with 3-7 players (active but room to join)
+                            if job_id and job_id not in existing and 3 <= players <= 7:
+                                new_jobs.append(job_id)
                         
-                        # Sort by score (highest first)
-                        scored.sort(reverse=True)
+                        # Add high-player servers to FRONT of queue (priority)
+                        for job in new_jobs:
+                            server_cache.appendleft(job)
                         
-                        # Add to queue
-                        for _, job_id in scored:
-                            server_queue.append(job_id)
-                            total_new += 1
-                        
-                        stats["total_fetched"] += len(scored)
+                        total_new += len(new_jobs)
+                        stats["total_fetched"] += len(new_jobs)
                     
-                    pages += 1
+                    pages_fetched += 1
+                    
                     if not next_cursor:
                         break
                     cursor = next_cursor
+                    
+                    # Small delay between pages to avoid rate limit
                     time.sleep(0.1)
             
             stats["last_fetch"] = time.time()
-            stats["unique_servers"] = len(server_queue)
-            print(f"[CACHE] +{total_new} | Queue: {len(server_queue)} | Blacklist: {len(global_blacklist)}")
+            print(f"[CACHE] +{total_new} | Total: {len(server_cache)} | Blacklist: {len(blacklist)}")
             
         except Exception as e:
-            print(f"[ERROR] fetch: {e}")
+            print(f"[ERROR] fetch_job_ids: {e}")
             stats["fetch_errors"] += 1
         
-        # Dynamic refresh
-        if len(server_queue) < CACHE_LOW_THRESHOLD:
-            time.sleep(2)
-        elif len(server_queue) > CACHE_LIMIT * 0.8:
-            time.sleep(8)
-        else:
-            time.sleep(CACHE_REFRESH_INTERVAL)
+        # Dynamic refresh based on cache size
+        wait_time = CACHE_REFRESH_INTERVAL
+        if len(server_cache) < CACHE_LOW_THRESHOLD:
+            wait_time = 2  # Faster refresh when low
+        elif len(server_cache) > CACHE_LIMIT * 0.8:
+            wait_time = 10  # Slower when cache is full
+        
+        time.sleep(wait_time)
 
-# ================== UNIQUE SERVER DISTRIBUTION ==================
-def get_unique_server(bot_id=None):
-    """
-    Get a server that:
-    1. No other bot has been assigned recently (global blacklist)
-    2. This specific bot hasn't visited recently (bot blacklist)
-    """
-    with lock:
-        cleanup_global_blacklist()
-        if bot_id:
-            cleanup_bot_blacklist(bot_id)
-        
-        # Get bot's personal blacklist
-        bot_bl = bot_blacklist.get(bot_id, {}) if bot_id else {}
-        
-        # Find a server not in any blacklist
-        attempts = 0
-        max_attempts = min(100, len(server_queue))
-        
-        while server_queue and attempts < max_attempts:
-            job_id = server_queue.popleft()
-            
-            # Check global blacklist
-            if job_id in global_blacklist:
-                stats["collisions_prevented"] += 1
-                attempts += 1
-                continue
-            
-            # Check bot-specific blacklist
-            if job_id in bot_bl:
-                # Put it back at the end for other bots
-                server_queue.append(job_id)
-                stats["collisions_prevented"] += 1
-                attempts += 1
-                continue
-            
-            # Found a unique server!
-            # Add to GLOBAL blacklist - no other bot gets this
-            global_blacklist[job_id] = time.time() + BLACKLIST_DURATION
-            
-            # Add to bot's personal blacklist
-            if bot_id:
-                if bot_id not in bot_blacklist:
-                    bot_blacklist[bot_id] = {}
-                bot_blacklist[bot_id][job_id] = time.time() + BOT_BLACKLIST_DURATION
-            
-            stats["total_assigned"] += 1
-            return job_id
-        
-        return None
+def clear_cache_periodically():
+    """Periodic full cache clear to remove stale servers"""
+    while True:
+        time.sleep(CACHE_CLEAR_INTERVAL)
+        with lock:
+            old_size = len(server_cache)
+            server_cache.clear()
+            blacklist.clear()
+            print(f"[CLEARED] Cache reset (was {old_size} servers)")
 
-def get_unique_servers_batch(count, bot_id=None):
-    """Get multiple unique servers"""
-    servers = []
-    for _ in range(count):
-        job_id = get_unique_server(bot_id)
-        if job_id:
-            servers.append(job_id)
-        else:
-            break
-    return servers
-
-# ================== ENDPOINTS ==================
+# ------------------- ENDPOINTS -------------------
 
 @app.route("/", methods=["GET"])
 def home():
+    """Health check"""
+    uptime = int(time.time() - stats["uptime_start"])
     return jsonify({
-        "status": "Coverage API v3.0 - No Overlap",
-        "queue": len(server_queue),
-        "global_blacklist": len(global_blacklist),
-        "bots_tracked": len(bot_blacklist)
+        "status": "Main API running",
+        "cache": len(server_cache),
+        "uptime_seconds": uptime,
+        "version": "2.0"
     })
 
 @app.route("/status", methods=["GET"])
 def status():
+    """Detailed status"""
     with lock:
-        cleanup_global_blacklist()
-        cleanup_all_bot_blacklists()
+        cleanup_blacklist()
+        uptime = int(time.time() - stats["uptime_start"])
         return jsonify({
-            "queue_size": len(server_queue),
-            "global_blacklist": len(global_blacklist),
-            "bots_tracked": len(bot_blacklist),
-            "total_assigned": stats["total_assigned"],
-            "collisions_prevented": stats["collisions_prevented"],
-            "total_fetched": stats["total_fetched"],
+            "cache_jobs": len(server_cache),
+            "jobs_assigned": stats["total_assigned"],
+            "jobs_fetched": stats["total_fetched"],
+            "blacklist_jobs": len(blacklist),
             "fetch_errors": stats["fetch_errors"],
-            "uptime": int(time.time() - stats["uptime_start"])
+            "last_fetch": stats["last_fetch"],
+            "uptime_seconds": uptime,
+            "cache_limit": CACHE_LIMIT
         })
 
 @app.route("/get-server", methods=["GET"])
 def get_server():
-    """Get a single unique server"""
-    bot_id = request.args.get("bot")
+    """Get a single server for a bot"""
+    global jobs_assigned
     
-    job_id = get_unique_server(bot_id)
-    
-    if job_id:
+    with lock:
+        cleanup_blacklist()
+        
+        if not server_cache:
+            return jsonify({"error": "No servers available"}), 404
+        
+        job_id = server_cache.popleft()  # O(1) operation
+        stats["total_assigned"] += 1
+        blacklist[job_id] = time.time() + BLACKLIST_DURATION
+        
         return jsonify({"job_id": job_id})
-    else:
-        return jsonify({"error": "No unique servers available"}), 404
+
+@app.route("/get-servers", methods=["GET"])
+def get_servers():
+    """Get multiple servers at once (for batch operations)"""
+    count = request.args.get("count", default=10, type=int)
+    count = min(count, 100)  # Max 100 per request
+    
+    with lock:
+        cleanup_blacklist()
+        
+        if not server_cache:
+            return jsonify({"job_ids": []})
+        
+        job_ids = []
+        for _ in range(min(count, len(server_cache))):
+            job_id = server_cache.popleft()
+            job_ids.append(job_id)
+            blacklist[job_id] = time.time() + BLACKLIST_DURATION
+            stats["total_assigned"] += 1
+        
+        return jsonify({"job_ids": job_ids, "count": len(job_ids)})
 
 @app.route("/get-batch", methods=["GET"])
 def get_batch():
-    """Get multiple unique servers"""
-    count = request.args.get("count", default=5, type=int)
-    count = min(count, 20)  # Max 20 per request
-    bot_id = request.args.get("bot")
-    
-    servers = get_unique_servers_batch(count, bot_id)
-    
-    return jsonify({
-        "servers": [{"job_id": j} for j in servers],
-        "count": len(servers),
-        "remaining": len(server_queue)
-    })
-
-@app.route("/return-server", methods=["POST"])
-def return_server():
-    """Return a server (e.g., if teleport failed)"""
-    data = request.get_json()
-    if not data or "job_id" not in data:
-        return jsonify({"error": "Missing job_id"}), 400
-    
-    job_id = data["job_id"]
-    bot_id = data.get("bot_id")
+    """Get a batch of servers for multiple bots"""
+    count = request.args.get("count", default=BATCH_SIZE, type=int)
+    count = min(count, 200)  # Max 200 per batch
     
     with lock:
-        # Remove from global blacklist
-        if job_id in global_blacklist:
-            del global_blacklist[job_id]
+        cleanup_blacklist()
         
-        # Remove from bot blacklist
-        if bot_id and bot_id in bot_blacklist:
-            if job_id in bot_blacklist[bot_id]:
-                del bot_blacklist[bot_id][job_id]
+        servers = []
+        for _ in range(min(count, len(server_cache))):
+            job_id = server_cache.popleft()
+            servers.append({"job_id": job_id})
+            blacklist[job_id] = time.time() + BLACKLIST_DURATION
+            stats["total_assigned"] += 1
         
-        # Add back to queue (at front for quick reuse)
-        if job_id not in server_queue:
-            server_queue.appendleft(job_id)
+        return jsonify({
+            "servers": servers,
+            "count": len(servers),
+            "remaining": len(server_cache)
+        })
+
+@app.route("/peek", methods=["GET"])
+def peek():
+    """Preview servers without removing them"""
+    count = request.args.get("count", default=10, type=int)
+    count = min(count, 100)
     
-    return jsonify({"status": "returned"})
+    with lock:
+        servers = list(server_cache)[:count]
+        return jsonify({
+            "job_ids": servers,
+            "total_available": len(server_cache)
+        })
 
 @app.route("/add-pool", methods=["POST"])
 def add_pool():
-    """Add servers from mini API"""
+    """Add servers from external source"""
     data = request.get_json()
+    
     if not data or "servers" not in data:
-        return jsonify({"error": "Missing servers"}), 400
+        return jsonify({"error": "Missing 'servers' field"}), 400
+    
+    servers = data["servers"]
+    if not isinstance(servers, list):
+        return jsonify({"error": "'servers' must be a list"}), 400
     
     added = 0
     with lock:
-        existing = set(server_queue) | set(global_blacklist.keys())
-        for job_id in data["servers"]:
+        cleanup_blacklist()
+        existing = set(server_cache) | set(blacklist.keys())
+        
+        for job_id in servers:
             if job_id and job_id not in existing:
-                server_queue.append(job_id)
+                server_cache.append(job_id)
                 added += 1
     
-    return jsonify({"added": added, "total": len(server_queue)})
+    print(f"[ADD POOL] +{added} | Total: {len(server_cache)}")
+    return jsonify({"added": added, "total": len(server_cache)})
+
+@app.route("/return-server", methods=["POST"])
+def return_server():
+    """Return a server back to the pool (e.g., if bot failed to join)"""
+    data = request.get_json()
+    
+    if not data or "job_id" not in data:
+        return jsonify({"error": "Missing 'job_id' field"}), 400
+    
+    job_id = data["job_id"]
+    
+    with lock:
+        # Remove from blacklist and add back to cache
+        if job_id in blacklist:
+            del blacklist[job_id]
+        
+        if job_id not in server_cache:
+            server_cache.appendleft(job_id)  # Add to front (priority)
+    
+    return jsonify({"status": "returned", "job_id": job_id})
+
+@app.route("/blacklist", methods=["POST"])
+def add_to_blacklist():
+    """Manually blacklist a server"""
+    data = request.get_json()
+    
+    if not data or "job_id" not in data:
+        return jsonify({"error": "Missing 'job_id' field"}), 400
+    
+    job_id = data["job_id"]
+    duration = data.get("duration", BLACKLIST_DURATION)
+    
+    with lock:
+        blacklist[job_id] = time.time() + duration
+        # Remove from cache if present
+        if job_id in server_cache:
+            server_cache.remove(job_id)
+    
+    return jsonify({"status": "blacklisted", "job_id": job_id, "duration": duration})
+
+@app.route("/clear-blacklist", methods=["POST"])
+def clear_blacklist_endpoint():
+    """Clear all blacklisted servers"""
+    with lock:
+        count = len(blacklist)
+        blacklist.clear()
+    
+    return jsonify({"cleared": count})
 
 @app.route("/stats", methods=["GET"])
 def get_stats():
+    """Get detailed statistics"""
     uptime = int(time.time() - stats["uptime_start"])
+    hours = uptime // 3600
+    minutes = (uptime % 3600) // 60
+    
     with lock:
         return jsonify({
-            "queue_size": len(server_queue),
-            "global_blacklist": len(global_blacklist),
-            "bots_tracked": len(bot_blacklist),
+            "cache_size": len(server_cache),
+            "cache_limit": CACHE_LIMIT,
+            "cache_percent": round(len(server_cache) / CACHE_LIMIT * 100, 1),
+            "blacklist_size": len(blacklist),
             "total_assigned": stats["total_assigned"],
-            "collisions_prevented": stats["collisions_prevented"],
-            "servers_per_minute": round(stats["total_assigned"] / max(uptime / 60, 1), 1),
-            "uptime_seconds": uptime
+            "total_fetched": stats["total_fetched"],
+            "fetch_errors": stats["fetch_errors"],
+            "uptime": f"{hours}h {minutes}m",
+            "uptime_seconds": uptime,
+            "servers_per_minute": round(stats["total_assigned"] / max(uptime / 60, 1), 1)
         })
 
-@app.route("/bot-stats/<bot_id>", methods=["GET"])
-def bot_stats(bot_id):
-    """Get stats for a specific bot"""
-    with lock:
-        cleanup_bot_blacklist(bot_id)
-        bl = bot_blacklist.get(bot_id, {})
-        return jsonify({
-            "bot_id": bot_id,
-            "servers_visited": len(bl),
-            "blacklist_expires": [
-                {"job_id": j[:12], "expires_in": int(exp - time.time())}
-                for j, exp in sorted(bl.items(), key=lambda x: x[1])[:10]
-            ]
-        })
+# ------------------- MAIN -------------------
 
-@app.route("/clear-bot/<bot_id>", methods=["POST"])
-def clear_bot(bot_id):
-    """Clear a bot's blacklist (e.g., if restarting)"""
-    with lock:
-        if bot_id in bot_blacklist:
-            count = len(bot_blacklist[bot_id])
-            del bot_blacklist[bot_id]
-            return jsonify({"cleared": count})
-    return jsonify({"cleared": 0})
-
-# ================== MAIN ==================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     
+    # Start background threads
     threading.Thread(target=fetch_job_ids, daemon=True).start()
+    threading.Thread(target=clear_cache_periodically, daemon=True).start()
     
     print(f"""
-╔═══════════════════════════════════════════════╗
-║     COVERAGE MAIN API v3.0                    ║
-╠═══════════════════════════════════════════════╣
-║  🎯 STRICT NO OVERLAP MODE                    ║
-║  ⏱️  Global Blacklist: {BLACKLIST_DURATION}s                  ║
-║  🤖 Bot Blacklist: {BOT_BLACKLIST_DURATION}s                    ║
-║  📊 Every bot = unique server                 ║
-╚═══════════════════════════════════════════════╝
+╔══════════════════════════════════════════╗
+║       MAIN API - Server Pool v2.0        ║
+╠══════════════════════════════════════════╣
+║  Port: {port}                              
+║  Cache Limit: {CACHE_LIMIT:,}                   
+║  Refresh: Every {CACHE_REFRESH_INTERVAL}s                    
+║  Blacklist Duration: {BLACKLIST_DURATION}s               
+║  Optimized for: 300+ bots                ║
+╚══════════════════════════════════════════╝
     """)
     
+    # Use threaded mode for better concurrency
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
