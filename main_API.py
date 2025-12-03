@@ -1,374 +1,337 @@
 #!/usr/bin/env python3
+"""
+OPTIMIZED MAIN API - For 400+ Bot Server Hopping
+Features:
+- Atomic server assignment (no duplicates ever)
+- Parallel Roblox API fetching
+- Smart prioritization by player count
+- High-throughput thread-safe design
+- Batch assignment for efficiency
+"""
+
+import os
+import time
+import logging
+import threading
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, jsonify, request
 import requests
-import threading
-import time
-import os
-from collections import deque
-import random
+
+# ==================== CONFIG ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ---------------- CONFIG ----------------
-GAME_ID = "109983668079237"  # Universe ID
+# Roblox Config
+GAME_ID = os.environ.get("GAME_ID", "109983668079237")
+BASE_URL = f"https://games.roblox.com/v1/games/{GAME_ID}/servers/Public"
 
-# Multiple Place IDs to fetch from (main game + rebirth servers)
-PLACE_IDS = [
-    "109983668079237",  # Main game
-]
+# Performance Tuning
+MAX_CACHE_SIZE = 10000              # Store up to 10k servers
+MIN_CACHE_THRESHOLD = 200           # Trigger fetch when below this
+BLACKLIST_DURATION = 180            # Seconds before server can be reused
+FETCH_WORKERS = 8                   # Parallel fetch threads
+FETCH_PAGES_PER_CYCLE = 50          # Max pages to fetch per cycle
+FETCH_INTERVAL = 5                  # Seconds between fetch cycles
+CACHE_CLEAR_INTERVAL = 600          # Clear stale data every 10 min
+REQUEST_TIMEOUT = 8                 # Roblox API timeout
 
-# API URLs
-ROBLOX_API_BASE = "https://games.roblox.com/v1/games/{}/servers/Public?sortOrder=Asc&limit=100"
-
-# Cache settings - Optimized for 300 bots
-CACHE_LIMIT = 50000              # 50k servers max
-CACHE_REFRESH_INTERVAL = 5       # Fetch every 5 seconds
-CACHE_LOW_THRESHOLD = 5000       # Refresh early if below 5k
-BLACKLIST_DURATION = 180         # 3 min blacklist (shorter for more servers)
-ROBLOX_TIMEOUT = 15
-CACHE_CLEAR_INTERVAL = 3600      # Clear every 1 hour
-
-# Rate limiting
-MAX_REQUESTS_PER_SECOND = 100    # Max requests per second
-BATCH_SIZE = 100                  # Servers per batch request
-
-# Pagination - fetch multiple pages
-MAX_PAGES_PER_FETCH = 10        # Fetch up to 10 pages (1000 servers) per cycle
-# ---------------------------------------
-
-# Use deque for O(1) popleft operations
-server_cache = deque(maxlen=CACHE_LIMIT)
-jobs_assigned = 0
-blacklist = {}
-lock = threading.RLock()  # Reentrant lock for nested calls
-
-# Stats tracking
-stats = {
-    "total_assigned": 0,
-    "total_fetched": 0,
-    "fetch_errors": 0,
-    "last_fetch": None,
-    "uptime_start": time.time()
-}
-
-def cleanup_blacklist():
-    """Remove expired blacklist entries"""
-    now = time.time()
-    expired = [job for job, exp in blacklist.items() if exp <= now]
-    for job in expired:
-        del blacklist[job]
-    return len(expired)
-
-def fetch_servers_from_page(place_id, cursor=None):
-    """Fetch a single page of servers"""
-    url = ROBLOX_API_BASE.format(place_id)
-    if cursor:
-        url += f"&cursor={cursor}"
+# ==================== DATA STRUCTURES ====================
+class AtomicServerPool:
+    """Thread-safe server pool with atomic operations"""
     
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._servers = deque()           # (job_id, players, timestamp)
+        self._assigned = set()            # Currently assigned job_ids
+        self._blacklist = {}              # job_id -> expiry_time
+        self._stats = {
+            'total_assigned': 0,
+            'total_fetched': 0,
+            'duplicates_blocked': 0
+        }
+    
+    def add_servers(self, servers):
+        """Add multiple servers atomically, returns count added"""
+        added = 0
+        now = time.time()
+        
+        with self._lock:
+            self._cleanup_blacklist(now)
+            existing = {s[0] for s in self._servers}
+            blocked = existing | self._assigned | set(self._blacklist.keys())
+            
+            for job_id, players in servers:
+                if job_id not in blocked:
+                    self._servers.append((job_id, players, now))
+                    added += 1
+                else:
+                    self._stats['duplicates_blocked'] += 1
+            
+            # Sort by player count (higher = better) and keep limit
+            if len(self._servers) > MAX_CACHE_SIZE:
+                sorted_servers = sorted(self._servers, key=lambda x: -x[1])
+                self._servers = deque(sorted_servers[:MAX_CACHE_SIZE])
+            
+            self._stats['total_fetched'] += added
+        
+        return added
+    
+    def get_server(self):
+        """Get single best server atomically"""
+        with self._lock:
+            self._cleanup_blacklist(time.time())
+            
+            if not self._servers:
+                return None
+            
+            # Get server with most players (first after sort)
+            best_idx = 0
+            best_players = -1
+            for i, (job_id, players, _) in enumerate(self._servers):
+                if players > best_players:
+                    best_players = players
+                    best_idx = i
+            
+            # Remove and blacklist
+            job_id, players, _ = self._servers[best_idx]
+            del self._servers[best_idx]
+            
+            self._assigned.add(job_id)
+            self._blacklist[job_id] = time.time() + BLACKLIST_DURATION
+            self._stats['total_assigned'] += 1
+            
+            return {'job_id': job_id, 'players': players}
+    
+    def get_batch(self, count):
+        """Get multiple unique servers atomically - CRITICAL for 400 bots"""
+        results = []
+        
+        with self._lock:
+            self._cleanup_blacklist(time.time())
+            
+            # Sort by players descending
+            sorted_servers = sorted(self._servers, key=lambda x: -x[1])
+            
+            for job_id, players, ts in sorted_servers:
+                if len(results) >= count:
+                    break
+                if job_id not in self._assigned:
+                    results.append({'job_id': job_id, 'players': players})
+                    self._assigned.add(job_id)
+                    self._blacklist[job_id] = time.time() + BLACKLIST_DURATION
+                    self._stats['total_assigned'] += 1
+            
+            # Remove assigned servers from cache
+            assigned_ids = {r['job_id'] for r in results}
+            self._servers = deque(
+                s for s in self._servers if s[0] not in assigned_ids
+            )
+        
+        return results
+    
+    def release_server(self, job_id):
+        """Release a server back (bot finished with it)"""
+        with self._lock:
+            self._assigned.discard(job_id)
+            # Keep in blacklist to prevent immediate reassignment
+    
+    def _cleanup_blacklist(self, now):
+        """Remove expired blacklist entries"""
+        expired = [k for k, exp in self._blacklist.items() if exp <= now]
+        for k in expired:
+            del self._blacklist[k]
+            self._assigned.discard(k)
+    
+    def clear_all(self):
+        """Full reset"""
+        with self._lock:
+            self._servers.clear()
+            self._assigned.clear()
+            self._blacklist.clear()
+    
+    def get_stats(self):
+        """Get current statistics"""
+        with self._lock:
+            self._cleanup_blacklist(time.time())
+            return {
+                'available': len(self._servers),
+                'assigned': len(self._assigned),
+                'blacklisted': len(self._blacklist),
+                'total_assigned': self._stats['total_assigned'],
+                'total_fetched': self._stats['total_fetched'],
+                'duplicates_blocked': self._stats['duplicates_blocked']
+            }
+
+# Global pool instance
+pool = AtomicServerPool()
+
+# ==================== PARALLEL FETCHING ====================
+def fetch_page(cursor=None, page_num=0):
+    """Fetch single page from Roblox API"""
     try:
-        response = requests.get(url, timeout=ROBLOX_TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-        servers = data.get("data", [])
+        params = {'sortOrder': 'Desc', 'limit': 100}  # Desc = fuller servers first
+        if cursor:
+            params['cursor'] = cursor
         
-        # Sort by player count (higher = better, more brainrots)
-        servers.sort(key=lambda x: x.get("playing", 0), reverse=True)
+        resp = requests.get(BASE_URL, params=params, timeout=REQUEST_TIMEOUT)
         
-        return servers, data.get("nextPageCursor")
+        if resp.status_code == 429:
+            log.warning(f"[Page {page_num}] Rate limited, backing off...")
+            time.sleep(2)
+            return [], None, False
+        
+        resp.raise_for_status()
+        data = resp.json()
+        
+        servers = [(s['id'], s.get('playing', 0)) for s in data.get('data', []) if s.get('id')]
+        next_cursor = data.get('nextPageCursor')
+        
+        return servers, next_cursor, True
+        
     except Exception as e:
-        stats["fetch_errors"] += 1
-        print(f"[ERROR] Fetch failed: {e}")
-        return [], None
+        log.error(f"[Page {page_num}] Fetch error: {e}")
+        return [], None, False
 
-def fetch_job_ids():
-    """Main fetch loop - fetches from multiple pages"""
-    global server_cache
+def parallel_fetch_all():
+    """Fetch multiple pages in parallel"""
+    all_servers = []
+    cursors_to_fetch = [None]  # Start with first page
+    page_count = 0
     
+    while cursors_to_fetch and page_count < FETCH_PAGES_PER_CYCLE:
+        batch_cursors = cursors_to_fetch[:FETCH_WORKERS]
+        cursors_to_fetch = cursors_to_fetch[FETCH_WORKERS:]
+        
+        with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+            futures = {
+                executor.submit(fetch_page, cursor, page_count + i): cursor 
+                for i, cursor in enumerate(batch_cursors)
+            }
+            
+            for future in as_completed(futures):
+                servers, next_cursor, success = future.result()
+                if success:
+                    all_servers.extend(servers)
+                    if next_cursor:
+                        cursors_to_fetch.append(next_cursor)
+                page_count += 1
+        
+        # Small delay between batches
+        time.sleep(0.3)
+    
+    return all_servers
+
+def fetch_loop():
+    """Background fetch loop"""
     while True:
         try:
-            total_new = 0
+            stats = pool.get_stats()
             
-            for place_id in PLACE_IDS:
-                cursor = None
-                pages_fetched = 0
-                
-                while pages_fetched < MAX_PAGES_PER_FETCH:
-                    servers, next_cursor = fetch_servers_from_page(place_id, cursor)
-                    
-                    if not servers:
-                        break
-                    
-                    with lock:
-                        cleanup_blacklist()
-                        existing = set(server_cache) | set(blacklist.keys())
-                        
-                        new_jobs = []
-                        for s in servers:
-                            job_id = s.get("id")
-                            players = s.get("playing", 0)
-                            # Prioritize servers with 3-7 players (active but room to join)
-                            if job_id and job_id not in existing and 3 <= players <= 7:
-                                new_jobs.append(job_id)
-                        
-                        # Add high-player servers to FRONT of queue (priority)
-                        for job in new_jobs:
-                            server_cache.appendleft(job)
-                        
-                        total_new += len(new_jobs)
-                        stats["total_fetched"] += len(new_jobs)
-                    
-                    pages_fetched += 1
-                    
-                    if not next_cursor:
-                        break
-                    cursor = next_cursor
-                    
-                    # Small delay between pages to avoid rate limit
-                    time.sleep(0.1)
-            
-            stats["last_fetch"] = time.time()
-            print(f"[CACHE] +{total_new} | Total: {len(server_cache)} | Blacklist: {len(blacklist)}")
+            # Fetch if cache is low
+            if stats['available'] < MIN_CACHE_THRESHOLD:
+                log.info(f"[FETCH] Cache low ({stats['available']}), fetching more...")
+                servers = parallel_fetch_all()
+                added = pool.add_servers(servers)
+                log.info(f"[FETCH] Added {added} servers (fetched {len(servers)}, blocked {len(servers)-added} dupes)")
+            else:
+                log.debug(f"[FETCH] Cache OK: {stats['available']} servers")
             
         except Exception as e:
-            print(f"[ERROR] fetch_job_ids: {e}")
-            stats["fetch_errors"] += 1
+            log.exception(f"[FETCH] Error: {e}")
         
-        # Dynamic refresh based on cache size
-        wait_time = CACHE_REFRESH_INTERVAL
-        if len(server_cache) < CACHE_LOW_THRESHOLD:
-            wait_time = 2  # Faster refresh when low
-        elif len(server_cache) > CACHE_LIMIT * 0.8:
-            wait_time = 10  # Slower when cache is full
-        
-        time.sleep(wait_time)
+        time.sleep(FETCH_INTERVAL)
 
-def clear_cache_periodically():
-    """Periodic full cache clear to remove stale servers"""
+def cleanup_loop():
+    """Periodic full cleanup"""
     while True:
         time.sleep(CACHE_CLEAR_INTERVAL)
-        with lock:
-            old_size = len(server_cache)
-            server_cache.clear()
-            blacklist.clear()
-            print(f"[CLEARED] Cache reset (was {old_size} servers)")
+        log.info("[CLEANUP] Clearing stale data...")
+        pool.clear_all()
 
-# ------------------- ENDPOINTS -------------------
+# ==================== API ENDPOINTS ====================
 
-@app.route("/", methods=["GET"])
-def home():
-    """Health check"""
-    uptime = int(time.time() - stats["uptime_start"])
+@app.route('/status', methods=['GET'])
+def status():
+    """Get pool statistics"""
+    return jsonify(pool.get_stats())
+
+@app.route('/get-server', methods=['GET'])
+def get_server():
+    """Get single best server"""
+    server = pool.get_server()
+    if not server:
+        return jsonify({'error': 'No servers available'}), 404
+    
+    log.info(f"[ASSIGN] {server['job_id']} (players: {server['players']})")
+    return jsonify(server)
+
+@app.route('/get-batch', methods=['GET'])
+def get_batch():
+    """Get multiple unique servers - USE THIS FOR 400 BOTS"""
+    count = request.args.get('count', default=10, type=int)
+    count = min(count, 100)  # Cap at 100 per request
+    
+    servers = pool.get_batch(count)
+    log.info(f"[BATCH] Assigned {len(servers)} servers")
+    return jsonify({'servers': servers, 'count': len(servers)})
+
+@app.route('/get-servers', methods=['GET'])
+def get_servers():
+    """List all available servers (for monitoring)"""
+    stats = pool.get_stats()
     return jsonify({
-        "status": "Main API running",
-        "cache": len(server_cache),
-        "uptime_seconds": uptime,
-        "version": "2.0"
+        'available': stats['available'],
+        'job_ids': []  # Don't expose full list for security
     })
 
-@app.route("/status", methods=["GET"])
-def status():
-    """Detailed status"""
-    with lock:
-        cleanup_blacklist()
-        uptime = int(time.time() - stats["uptime_start"])
-        return jsonify({
-            "cache_jobs": len(server_cache),
-            "jobs_assigned": stats["total_assigned"],
-            "jobs_fetched": stats["total_fetched"],
-            "blacklist_jobs": len(blacklist),
-            "fetch_errors": stats["fetch_errors"],
-            "last_fetch": stats["last_fetch"],
-            "uptime_seconds": uptime,
-            "cache_limit": CACHE_LIMIT
-        })
+@app.route('/release', methods=['POST'])
+def release_server():
+    """Release a server back to pool when bot is done"""
+    data = request.get_json() or {}
+    job_id = data.get('job_id')
+    if job_id:
+        pool.release_server(job_id)
+        return jsonify({'released': job_id})
+    return jsonify({'error': 'Missing job_id'}), 400
 
-@app.route("/get-server", methods=["GET"])
-def get_server():
-    """Get a single server for a bot"""
-    global jobs_assigned
-    
-    with lock:
-        cleanup_blacklist()
-        
-        if not server_cache:
-            return jsonify({"error": "No servers available"}), 404
-        
-        job_id = server_cache.popleft()  # O(1) operation
-        stats["total_assigned"] += 1
-        blacklist[job_id] = time.time() + BLACKLIST_DURATION
-        
-        return jsonify({"job_id": job_id})
-
-@app.route("/get-servers", methods=["GET"])
-def get_servers():
-    """Get multiple servers at once (for batch operations)"""
-    count = request.args.get("count", default=10, type=int)
-    count = min(count, 100)  # Max 100 per request
-    
-    with lock:
-        cleanup_blacklist()
-        
-        if not server_cache:
-            return jsonify({"job_ids": []})
-        
-        job_ids = []
-        for _ in range(min(count, len(server_cache))):
-            job_id = server_cache.popleft()
-            job_ids.append(job_id)
-            blacklist[job_id] = time.time() + BLACKLIST_DURATION
-            stats["total_assigned"] += 1
-        
-        return jsonify({"job_ids": job_ids, "count": len(job_ids)})
-
-@app.route("/get-batch", methods=["GET"])
-def get_batch():
-    """Get a batch of servers for multiple bots"""
-    count = request.args.get("count", default=BATCH_SIZE, type=int)
-    count = min(count, 200)  # Max 200 per batch
-    
-    with lock:
-        cleanup_blacklist()
-        
-        servers = []
-        for _ in range(min(count, len(server_cache))):
-            job_id = server_cache.popleft()
-            servers.append({"job_id": job_id})
-            blacklist[job_id] = time.time() + BLACKLIST_DURATION
-            stats["total_assigned"] += 1
-        
-        return jsonify({
-            "servers": servers,
-            "count": len(servers),
-            "remaining": len(server_cache)
-        })
-
-@app.route("/peek", methods=["GET"])
-def peek():
-    """Preview servers without removing them"""
-    count = request.args.get("count", default=10, type=int)
-    count = min(count, 100)
-    
-    with lock:
-        servers = list(server_cache)[:count]
-        return jsonify({
-            "job_ids": servers,
-            "total_available": len(server_cache)
-        })
-
-@app.route("/add-pool", methods=["POST"])
+@app.route('/add-pool', methods=['POST'])
 def add_pool():
-    """Add servers from external source"""
-    data = request.get_json()
+    """Add servers from external source (mini_api)"""
+    data = request.get_json() or {}
+    servers = data.get('servers', [])
     
-    if not data or "servers" not in data:
-        return jsonify({"error": "Missing 'servers' field"}), 400
-    
-    servers = data["servers"]
     if not isinstance(servers, list):
-        return jsonify({"error": "'servers' must be a list"}), 400
+        return jsonify({'error': "'servers' must be a list"}), 400
     
-    added = 0
-    with lock:
-        cleanup_blacklist()
-        existing = set(server_cache) | set(blacklist.keys())
-        
-        for job_id in servers:
-            if job_id and job_id not in existing:
-                server_cache.append(job_id)
-                added += 1
+    # Convert to (job_id, players) format
+    server_tuples = [(s, 0) if isinstance(s, str) else (s.get('id', s), s.get('players', 0)) for s in servers]
+    added = pool.add_servers(server_tuples)
     
-    print(f"[ADD POOL] +{added} | Total: {len(server_cache)}")
-    return jsonify({"added": added, "total": len(server_cache)})
+    log.info(f"[ADD-POOL] Added {added}/{len(servers)} servers")
+    return jsonify({'added': added})
 
-@app.route("/return-server", methods=["POST"])
-def return_server():
-    """Return a server back to the pool (e.g., if bot failed to join)"""
-    data = request.get_json()
-    
-    if not data or "job_id" not in data:
-        return jsonify({"error": "Missing 'job_id' field"}), 400
-    
-    job_id = data["job_id"]
-    
-    with lock:
-        # Remove from blacklist and add back to cache
-        if job_id in blacklist:
-            del blacklist[job_id]
-        
-        if job_id not in server_cache:
-            server_cache.appendleft(job_id)  # Add to front (priority)
-    
-    return jsonify({"status": "returned", "job_id": job_id})
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({'status': 'ok', 'timestamp': time.time()})
 
-@app.route("/blacklist", methods=["POST"])
-def add_to_blacklist():
-    """Manually blacklist a server"""
-    data = request.get_json()
-    
-    if not data or "job_id" not in data:
-        return jsonify({"error": "Missing 'job_id' field"}), 400
-    
-    job_id = data["job_id"]
-    duration = data.get("duration", BLACKLIST_DURATION)
-    
-    with lock:
-        blacklist[job_id] = time.time() + duration
-        # Remove from cache if present
-        if job_id in server_cache:
-            server_cache.remove(job_id)
-    
-    return jsonify({"status": "blacklisted", "job_id": job_id, "duration": duration})
-
-@app.route("/clear-blacklist", methods=["POST"])
-def clear_blacklist_endpoint():
-    """Clear all blacklisted servers"""
-    with lock:
-        count = len(blacklist)
-        blacklist.clear()
-    
-    return jsonify({"cleared": count})
-
-@app.route("/stats", methods=["GET"])
-def get_stats():
-    """Get detailed statistics"""
-    uptime = int(time.time() - stats["uptime_start"])
-    hours = uptime // 3600
-    minutes = (uptime % 3600) // 60
-    
-    with lock:
-        return jsonify({
-            "cache_size": len(server_cache),
-            "cache_limit": CACHE_LIMIT,
-            "cache_percent": round(len(server_cache) / CACHE_LIMIT * 100, 1),
-            "blacklist_size": len(blacklist),
-            "total_assigned": stats["total_assigned"],
-            "total_fetched": stats["total_fetched"],
-            "fetch_errors": stats["fetch_errors"],
-            "uptime": f"{hours}h {minutes}m",
-            "uptime_seconds": uptime,
-            "servers_per_minute": round(stats["total_assigned"] / max(uptime / 60, 1), 1)
-        })
-
-# ------------------- MAIN -------------------
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+# ==================== MAIN ====================
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8000))
     
     # Start background threads
-    threading.Thread(target=fetch_job_ids, daemon=True).start()
-    threading.Thread(target=clear_cache_periodically, daemon=True).start()
+    threading.Thread(target=fetch_loop, daemon=True).start()
+    threading.Thread(target=cleanup_loop, daemon=True).start()
     
-    print(f"""
-╔══════════════════════════════════════════╗
-║       MAIN API - Server Pool v2.0        ║
-╠══════════════════════════════════════════╣
-║  Port: {port}                              
-║  Cache Limit: {CACHE_LIMIT:,}                   
-║  Refresh: Every {CACHE_REFRESH_INTERVAL}s                    
-║  Blacklist Duration: {BLACKLIST_DURATION}s               
-║  Optimized for: 300+ bots                ║
-╚══════════════════════════════════════════╝
-    """)
+    log.info(f"🚀 Optimized Main API starting on port {port}")
+    log.info(f"   Max cache: {MAX_CACHE_SIZE}, Workers: {FETCH_WORKERS}")
     
-    # Use threaded mode for better concurrency
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+    # Use threaded mode for concurrent requests
+    app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
