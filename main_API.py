@@ -13,12 +13,10 @@ from flask import Flask, jsonify, request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 
-# ==================== CONFIG ====================
 SERVER_TTL = 1800
 PLACE_ID = 109983668079237
 SORT_ORDER = "Asc"
 
-# NAProxy US
 PROXY_HOST = "us.naproxy.net"
 PROXY_PORT = "1000"
 PROXY_USER = "proxy-e5a1ntzmrlr3_area-US"
@@ -30,11 +28,7 @@ SERVERS_PER_REQUEST = 100
 CURSORS_PER_CYCLE = 100
 MAX_POOL_SIZE = 100000
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(message)s',
-    datefmt='%H:%M:%S'
-)
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -191,8 +185,13 @@ class RobloxFetcher:
             if cursor:
                 params['cursor'] = cursor
             
-            response = requests.get(url, params=params, proxies=get_proxy(), timeout=10,
-                                   headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'})
+            response = requests.get(
+                url,
+                params=params,
+                proxies=get_proxy(),
+                timeout=10,
+                headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
+            )
             
             if response.status_code == 200:
                 data = response.json()
@@ -201,7 +200,7 @@ class RobloxFetcher:
             else:
                 pool.record_fetch_error()
                 return [], None
-        except:
+        except Exception as e:
             pool.record_fetch_error()
             return [], None
     
@@ -219,7 +218,7 @@ class RobloxFetcher:
                         total_added += pool.add_servers(servers, source="fetcher")
                     if next_cursor:
                         new_cursors.append(next_cursor)
-                except:
+                except Exception as e:
                     pass
         
         for c in new_cursors:
@@ -265,4 +264,33 @@ def get_server():
 
 @app.route('/get-batch', methods=['GET'])
 def get_batch():
-    count = min(request.args.get('count', defa
+    count = request.args.get('count', 100, type=int)
+    count = min(count, 200)
+    servers = pool.get_batch(count)
+    return jsonify({'servers': servers, 'count': len(servers)})
+
+@app.route('/add-pool', methods=['POST'])
+def add_pool():
+    data = request.get_json() or {}
+    servers = data.get('servers', [])
+    added = pool.add_servers(servers, source="mini-api")
+    log.info(f"[MINI] +{added}/{len(servers)} (pool: {pool.count()})")
+    return jsonify({'added': added, 'pool_size': pool.count()})
+
+@app.route('/report-dead', methods=['POST'])
+def report_dead():
+    data = request.get_json() or {}
+    if data.get('job_id'):
+        pool.report_dead(data['job_id'])
+    return jsonify({'status': 'ok'})
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'servers': pool.count()})
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8000))
+    log.info(f"[STARTUP] Main API - Port {port} - {SORT_ORDER}")
+    fetcher.start()
+    time.sleep(2)
+    app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
