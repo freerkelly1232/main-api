@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
 MAIN API - High Volume Server Pool with NAProxy
-- Fetches 3k-5k servers/minute from Roblox using residential proxies
-- Distributes to bots via /get-server and /get-batch
-- 30 minute TTL
 """
 
 import os
@@ -43,18 +40,8 @@ app = Flask(__name__)
 
 # ==================== PROXY ====================
 def get_proxy():
-    """Get NAProxy residential proxy with session rotation"""
     session_id = f"{random.randint(100000, 999999)}"
-    # NAProxy format: username_session-ID
     proxy_url = f"http://{PROXY_USER}_session-{session_id}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-    return {
-        'http': proxy_url,
-        'https': proxy_url
-    }
-
-def get_static_proxy():
-    """Get static proxy (no rotation)"""
-    proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
     return {
         'http': proxy_url,
         'https': proxy_url
@@ -277,7 +264,7 @@ class RobloxFetcher:
             self.servers_this_minute += total_added
             if time.time() - self.last_reset >= 60:
                 rate = self.servers_this_minute
-                log.info(f"📊 Rate: {rate} servers/min | Pool: {pool.count()} | Seen: {pool.seen_count()}")
+                log.info(f"[STATS] Rate: {rate} servers/min | Pool: {pool.count()} | Seen: {pool.seen_count()}")
                 self.servers_this_minute = 0
                 self.last_reset = time.time()
         
@@ -285,13 +272,11 @@ class RobloxFetcher:
     
     def run(self):
         self.running = True
-        log.info("🔄 Fetcher started with NAProxy")
+        log.info("[FETCHER] Started with NAProxy")
         
         while self.running:
             try:
-                added = self.fetch_cycle()
-                if added > 0:
-                    log.debug(f"Cycle: +{added} servers")
+                self.fetch_cycle()
             except Exception as e:
                 log.error(f"Fetch cycle error: {e}")
             
@@ -300,7 +285,7 @@ class RobloxFetcher:
     def start(self):
         thread = threading.Thread(target=self.run, daemon=True)
         thread.start()
-        log.info("🚀 Background fetcher started")
+        log.info("[FETCHER] Background thread started")
     
     def stop(self):
         self.running = False
@@ -356,36 +341,10 @@ def health():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     
-    log.info(f"🚀 Main API starting on port {port}")
-    log.info(f"⏱️ Server TTL: {SERVER_TTL}s (30 min)")
-    log.info(f"🌐 Proxy: {PROXY_HOST}:{PROXY_PORT}")
-    log.info(f"🔧 Threads: {FETCH_THREADS} | Interval: {FETCH_INTERVAL}s")
+    log.info(f"[STARTUP] Main API on port {port}")
+    log.info(f"[CONFIG] TTL: {SERVER_TTL}s | Proxy: {PROXY_HOST}:{PROXY_PORT}")
     
-    # Start background fetcher
     fetcher.start()
-    
     time.sleep(3)
     
     app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
-```
-
----
-
-## ✅ Your NAProxy is configured:
-
-| Setting | Value |
-|---------|-------|
-| Host | us.naproxy.net |
-| Port | 1000 |
-| Username | proxy-e5a1ntzmrlr3_area-US |
-| Password | Ol43jGdsIuPUNacc |
-| Session rotation | ✅ Enabled |
-
----
-
-## 📦 Requirements
-
-Add to your `requirements.txt`:
-```
-flask
-requests
