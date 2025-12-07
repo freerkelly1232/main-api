@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-MAIN API v3 - Wealth-Based Server Targeting
-- Deep pagination for more servers
-- Wealth scoring from bot scouts
-- Rich servers get highest priority
+MAIN API - Deep Pagination + 5-8 Priority
 """
 
 import os
@@ -17,25 +14,21 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 
 # ==================== CONFIG ====================
-SERVER_TTL = 1800  # 30 minutes
+SERVER_TTL = 1800
 PLACE_ID = 109983668079237
 
-# NAProxy Config
+# NAProxy
 PROXY_HOST = "us.naproxy.net"
 PROXY_PORT = "1000"
 PROXY_USER = "proxy-e5a1ntzmrlr3_area-US"
 PROXY_PASS = "Ol43jGdsIuPUNacc"
 
-# DEEP FETCHING
+# Deep fetching
 FETCH_THREADS = 25
 FETCH_INTERVAL = 1
 SERVERS_PER_REQUEST = 100
-CURSORS_PER_CYCLE = 200  # More pages
-MAX_STORED_CURSORS = 3000  # Way deeper
-
-# Priority settings
-WEALTH_PRIORITY_BOOST = 500  # Big boost for wealthy servers
-WEALTH_EXPIRE = 600  # Wealth data expires after 10 min
+CURSORS_PER_CYCLE = 200
+MAX_STORED_CURSORS = 3000
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,17 +49,15 @@ def get_proxy():
 class ServerPool:
     def __init__(self):
         self._lock = threading.Lock()
-        self._servers = {}  # job_id -> {players, added_time, priority, wealth_score}
+        self._servers = {}
         self._seen_jobs = OrderedDict()
         self._dead_servers = set()
         self._given_servers = {}
-        self._wealth_data = {}  # job_id -> {score, timestamp, details}
         self._stats = {
             'total_given': 0,
             'total_received': 0,
             'duplicates_skipped': 0,
             'dead_skipped': 0,
-            'wealth_reports': 0,
             'fetch_errors': 0,
             'fetch_success': 0
         }
@@ -74,7 +65,6 @@ class ServerPool:
     def _clean_expired(self):
         now = time.time()
         
-        # Clean expired servers
         expired = [jid for jid, data in self._servers.items() 
                    if now - data['added_time'] > SERVER_TTL]
         for jid in expired:
@@ -82,21 +72,13 @@ class ServerPool:
             if jid in self._seen_jobs:
                 del self._seen_jobs[jid]
         
-        # Clean old seen jobs
         while len(self._seen_jobs) > 100000:
             self._seen_jobs.popitem(last=False)
         
-        # Clean old given
         old_given = [k for k, v in self._given_servers.items() if now - v > 120]
         for k in old_given:
             del self._given_servers[k]
         
-        # Clean old wealth data
-        old_wealth = [k for k, v in self._wealth_data.items() if now - v['timestamp'] > WEALTH_EXPIRE]
-        for k in old_wealth:
-            del self._wealth_data[k]
-        
-        # Clean dead servers
         if len(self._dead_servers) > 10000:
             self._dead_servers = set(list(self._dead_servers)[-5000:])
     
@@ -128,7 +110,7 @@ class ServerPool:
                     duplicates += 1
                     continue
                 
-                # Base priority by player count
+                # Priority: 5=50, 6-7=100, 8=20
                 if players == 5:
                     priority = 50
                 elif players == 6 or players == 7:
@@ -138,17 +120,10 @@ class ServerPool:
                 else:
                     priority = 10
                 
-                # Check if we have wealth data for this server
-                wealth_score = 0
-                if job_id in self._wealth_data:
-                    wealth_score = self._wealth_data[job_id]['score']
-                    priority += wealth_score  # Boost priority based on wealth
-                
                 self._servers[job_id] = {
                     'players': players,
                     'added_time': now,
-                    'priority': priority,
-                    'wealth_score': wealth_score
+                    'priority': priority
                 }
                 self._seen_jobs[job_id] = now
                 added += 1
@@ -158,35 +133,12 @@ class ServerPool:
         
         return added, duplicates
     
-    def report_wealth(self, job_id, wealth_score, details=None):
-        """Bot reports wealth score for a server"""
-        now = time.time()
-        
-        with self._lock:
-            self._wealth_data[job_id] = {
-                'score': wealth_score,
-                'timestamp': now,
-                'details': details or {}
-            }
-            
-            # Boost priority if server still in pool
-            if job_id in self._servers:
-                self._servers[job_id]['wealth_score'] = wealth_score
-                self._servers[job_id]['priority'] += wealth_score
-            
-            self._stats['wealth_reports'] += 1
-            
-            if wealth_score >= 50:
-                log.info(f"[WEALTH] High value server found! Score: {wealth_score} | Details: {details}")
-    
-    def get_server(self, bot_id=None):
-        """Get best available server - prioritizes wealthy servers"""
+    def get_server(self):
         now = time.time()
         
         with self._lock:
             self._clean_expired()
             
-            # Get available servers
             available = []
             for job_id, data in self._servers.items():
                 if job_id in self._dead_servers:
@@ -200,13 +152,10 @@ class ServerPool:
             if not available:
                 return None
             
-            # Sort by priority (highest first)
             available.sort(key=lambda x: x[1]['priority'], reverse=True)
             
-            # Get best server
             job_id, data = available[0]
             
-            # Mark as given
             self._given_servers[job_id] = now
             del self._servers[job_id]
             
@@ -216,7 +165,6 @@ class ServerPool:
                 'job_id': job_id,
                 'players': data['players'],
                 'priority': data['priority'],
-                'wealth_score': data.get('wealth_score', 0),
                 'age': int(now - data['added_time'])
             }
     
@@ -230,10 +178,6 @@ class ServerPool:
         with self._lock:
             return len(self._servers)
     
-    def get_wealthy_count(self):
-        with self._lock:
-            return len([s for s in self._servers.values() if s.get('wealth_score', 0) > 0])
-    
     def record_fetch_error(self):
         with self._lock:
             self._stats['fetch_errors'] += 1
@@ -245,16 +189,12 @@ class ServerPool:
     def get_stats(self):
         with self._lock:
             self._clean_expired()
-            wealthy = len([s for s in self._servers.values() if s.get('wealth_score', 0) > 0])
             return {
                 'available': len(self._servers),
-                'wealthy_servers': wealthy,
-                'wealth_data_cached': len(self._wealth_data),
                 'seen_total': len(self._seen_jobs),
                 'dead_servers': len(self._dead_servers),
                 'total_given': self._stats['total_given'],
                 'total_received': self._stats['total_received'],
-                'wealth_reports': self._stats['wealth_reports'],
                 'duplicates_skipped': self._stats['duplicates_skipped'],
                 'fetch_errors': self._stats['fetch_errors'],
                 'fetch_success': self._stats['fetch_success']
@@ -303,23 +243,20 @@ class DeepFetcher:
                 pool.record_fetch_error()
                 return [], None, sort_order
                 
-        except Exception as e:
+        except:
             pool.record_fetch_error()
             return [], None, sort_order
     
     def fetch_cycle(self):
         fetches = []
         
-        # Fresh fetches
         fetches.append((None, 'Asc'))
         fetches.append((None, 'Desc'))
         
-        # Deep cursors - sample from different depths
         with self.cursor_lock:
             asc_list = list(self.cursors_asc)
             desc_list = list(self.cursors_desc)
             
-            # Sample evenly across all depths
             step = max(1, len(asc_list) // 50)
             for i in range(0, len(asc_list), step):
                 fetches.append((asc_list[i], 'Asc'))
@@ -331,8 +268,8 @@ class DeepFetcher:
         fetches = fetches[:CURSORS_PER_CYCLE]
         
         total_added = 0
-        new_cursors_asc = []
-        new_cursors_desc = []
+        new_asc = []
+        new_desc = []
         
         with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
             futures = {executor.submit(self.fetch_page, c, s): (c, s) for c, s in fetches}
@@ -345,26 +282,25 @@ class DeepFetcher:
                         total_added += added
                     if next_cursor:
                         if sort_order == 'Asc':
-                            new_cursors_asc.append(next_cursor)
+                            new_asc.append(next_cursor)
                         else:
-                            new_cursors_desc.append(next_cursor)
+                            new_desc.append(next_cursor)
                 except:
                     pass
         
         with self.cursor_lock:
-            for c in new_cursors_asc:
+            for c in new_asc:
                 self.cursors_asc.append(c)
-            for c in new_cursors_desc:
+            for c in new_desc:
                 self.cursors_desc.append(c)
         
-        # Log stats
         self.servers_this_minute += total_added
         now = time.time()
         if now - self.last_reset >= 60:
             stats = pool.get_stats()
             with self.cursor_lock:
                 cursor_count = len(self.cursors_asc) + len(self.cursors_desc)
-            log.info(f"[RATE] +{self.servers_this_minute}/min | Pool: {stats['available']} | Wealthy: {stats['wealthy_servers']} | Cursors: {cursor_count}")
+            log.info(f"[RATE] +{self.servers_this_minute}/min | Pool: {stats['available']} | Cursors: {cursor_count}")
             self.servers_this_minute = 0
             self.last_reset = now
         
@@ -372,7 +308,7 @@ class DeepFetcher:
     
     def run(self):
         self.running = True
-        log.info("[FETCHER] Started - Deep pagination + Wealth targeting")
+        log.info("[FETCHER] Started - Deep pagination")
         
         while self.running:
             try:
@@ -399,25 +335,10 @@ def status():
 
 @app.route('/get-server', methods=['GET'])
 def get_server():
-    bot_id = request.args.get('bot_id', 'unknown')
-    server = pool.get_server(bot_id=bot_id)
+    server = pool.get_server()
     if not server:
         return jsonify({'error': 'No servers available'}), 404
     return jsonify(server)
-
-@app.route('/report-wealth', methods=['POST'])
-def report_wealth():
-    """Bot reports wealth score for a server"""
-    data = request.get_json() or {}
-    job_id = data.get('job_id')
-    wealth_score = data.get('wealth_score', 0)
-    details = data.get('details', {})
-    
-    if job_id and wealth_score > 0:
-        pool.report_wealth(job_id, wealth_score, details)
-        log.info(f"[WEALTH] {job_id[:12]}... score={wealth_score}")
-    
-    return jsonify({'status': 'noted', 'score': wealth_score})
 
 @app.route('/report-dead', methods=['POST'])
 def report_dead():
@@ -444,14 +365,9 @@ def add_pool():
 def health():
     return jsonify({'status': 'ok', 'servers': pool.count()})
 
-# ==================== MAIN ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
-    
-    log.info(f"[STARTUP] Main API v3 - Wealth Targeting on port {port}")
-    log.info(f"[CONFIG] Deep fetch: {CURSORS_PER_CYCLE} pages/cycle, {MAX_STORED_CURSORS} max cursors")
-    
+    log.info(f"[STARTUP] Main API on port {port}")
     fetcher.start()
     time.sleep(2)
-    
     app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
