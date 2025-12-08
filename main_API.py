@@ -23,11 +23,11 @@ PROXY_PORT = "1000"
 PROXY_USER = "proxy-e5a1ntzmrlr3_area-US"
 PROXY_PASS = "Ol43jGdsIuPUNacc"
 
-# Fetching config
-FETCH_THREADS = 20
-FETCH_INTERVAL = 1
+# Reduced fetching (proxy friendly)
+FETCH_THREADS = 8
+FETCH_INTERVAL = 2
 SERVERS_PER_REQUEST = 100
-CURSORS_PER_CYCLE = 100
+CURSORS_PER_CYCLE = 30
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,10 +77,16 @@ class ServerPool:
             else:
                 break
         
+        # Expire old seen jobs (allow re-discovery after 10 min)
+        old_seen = [k for k, v in self._seen_jobs.items() if now - v > 600]
+        for k in old_seen:
+            del self._seen_jobs[k]
+        
+        # Trim if still too big
         while len(self._seen_jobs) > 50000:
             self._seen_jobs.popitem(last=False)
         
-        old_given = [k for k, v in self._given_servers.items() if now - v > SERVER_TTL]
+        old_given = [k for k, v in self._given_servers.items() if now - v > 600]
         for k in old_given:
             del self._given_servers[k]
         
@@ -123,15 +129,17 @@ class ServerPool:
                     duplicates += 1
                     continue
                 
+                # Skip servers with <5 or 8 players
+                if players < 5 or players >= 8:
+                    continue
+                
                 # Priority based on player count
-                if players == 5:
-                    priority = 50
-                elif players == 6 or players == 7:
+                if players == 6 or players == 7:
                     priority = 100  # Best
-                elif players == 8:
-                    priority = 20
+                elif players == 5:
+                    priority = 50
                 else:
-                    priority = 10  # Less than 5
+                    priority = 10
                 
                 self._servers.append((job_id, players, now, priority))
                 self._seen_jobs[job_id] = now
@@ -229,48 +237,58 @@ pool = ServerPool()
 class RobloxFetcher:
     def __init__(self):
         self.running = False
-        self.cursors = deque(maxlen=1000)
+        self.cursors = deque(maxlen=500)
         self.cursor_lock = threading.Lock()
         self.last_reset = time.time()
         self.servers_this_minute = 0
         self.minute_lock = threading.Lock()
     
     def fetch_page(self, cursor=None):
-        try:
-            url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-            params = {'sortOrder': 'Asc', 'limit': SERVERS_PER_REQUEST}
-            if cursor:
-                params['cursor'] = cursor
-            
-            proxies = get_proxy()
-            
-            response = requests.get(
-                url,
-                params=params,
-                proxies=proxies,
-                timeout=10,
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': 'application/json'
-                }
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                servers = data.get('data', [])
-                next_cursor = data.get('nextPageCursor')
-                pool.record_fetch_success()
-                return servers, next_cursor
-            elif response.status_code == 429:
-                time.sleep(0.5)
-                return [], None
-            else:
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
+                params = {'sortOrder': 'Asc', 'limit': SERVERS_PER_REQUEST}
+                if cursor:
+                    params['cursor'] = cursor
+                
+                proxies = get_proxy()
+                
+                response = requests.get(
+                    url,
+                    params=params,
+                    proxies=proxies,
+                    timeout=15,
+                    headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                        'Accept': 'application/json'
+                    }
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    servers = data.get('data', [])
+                    next_cursor = data.get('nextPageCursor')
+                    pool.record_fetch_success()
+                    return servers, next_cursor
+                elif response.status_code == 429:
+                    time.sleep(2)
+                    return [], None
+                else:
+                    pool.record_fetch_error()
+                    return [], None
+                    
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError):
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                    continue
                 pool.record_fetch_error()
                 return [], None
-                
-        except Exception as e:
-            pool.record_fetch_error()
-            return [], None
+            except Exception as e:
+                pool.record_fetch_error()
+                return [], None
+        
+        return [], None
     
     def add_cursor(self, cursor):
         if cursor:
