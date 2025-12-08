@@ -129,8 +129,8 @@ class ServerPool:
                     duplicates += 1
                     continue
                 
-                # Skip servers with <5 or 8 players
-                if players < 5 or players >= 8:
+                # Skip servers with less than 5 players (low value)
+                if players < 5:
                     continue
                 
                 # Priority based on player count
@@ -237,18 +237,23 @@ pool = ServerPool()
 class RobloxFetcher:
     def __init__(self):
         self.running = False
-        self.cursors = deque(maxlen=500)
+        self.cursors_asc = deque(maxlen=2000)  # Deep Asc cursors
+        self.cursors_desc = deque(maxlen=2000)  # Deep Desc cursors
         self.cursor_lock = threading.Lock()
         self.last_reset = time.time()
         self.servers_this_minute = 0
         self.minute_lock = threading.Lock()
     
-    def fetch_page(self, cursor=None):
+    def fetch_page(self, cursor=None, sort_order='Asc'):
         max_retries = 2
         for attempt in range(max_retries):
             try:
                 url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-                params = {'sortOrder': 'Asc', 'limit': SERVERS_PER_REQUEST}
+                params = {
+                    'sortOrder': sort_order,
+                    'limit': SERVERS_PER_REQUEST,
+                    'excludeFullGames': 'true'
+                }
                 if cursor:
                     params['cursor'] = cursor
                 
@@ -270,55 +275,81 @@ class RobloxFetcher:
                     servers = data.get('data', [])
                     next_cursor = data.get('nextPageCursor')
                     pool.record_fetch_success()
-                    return servers, next_cursor
+                    return servers, next_cursor, sort_order
                 elif response.status_code == 429:
                     time.sleep(2)
-                    return [], None
+                    return [], None, sort_order
                 else:
                     pool.record_fetch_error()
-                    return [], None
+                    return [], None, sort_order
                     
             except (requests.exceptions.SSLError, requests.exceptions.ConnectionError):
                 if attempt < max_retries - 1:
                     time.sleep(1)
                     continue
                 pool.record_fetch_error()
-                return [], None
+                return [], None, sort_order
             except Exception as e:
                 pool.record_fetch_error()
-                return [], None
+                return [], None, sort_order
         
-        return [], None
-    
-    def add_cursor(self, cursor):
-        if cursor:
-            with self.cursor_lock:
-                self.cursors.append(cursor)
+        return [], None, sort_order
     
     def fetch_cycle(self):
-        cursors_to_fetch = [None]
+        fetches = []
+        
+        # Always start fresh from both ends
+        fetches.append((None, 'Asc'))
+        fetches.append((None, 'Desc'))
+        
+        # Sample DEEP cursors from both directions
         with self.cursor_lock:
-            cursors_to_fetch.extend(list(self.cursors)[:CURSORS_PER_CYCLE - 1])
+            asc_list = list(self.cursors_asc)
+            desc_list = list(self.cursors_desc)
+            
+            # Take cursors from END of list (deepest into the middle)
+            if asc_list:
+                # Prioritize DEEP cursors (end of list = closer to middle)
+                deep_asc = asc_list[-min(20, len(asc_list)):]  # Last 20 (deepest)
+                for c in deep_asc:
+                    fetches.append((c, 'Asc'))
+            
+            if desc_list:
+                # Prioritize DEEP cursors
+                deep_desc = desc_list[-min(20, len(desc_list)):]
+                for c in deep_desc:
+                    fetches.append((c, 'Desc'))
+        
+        # Limit per cycle
+        fetches = fetches[:CURSORS_PER_CYCLE]
         
         total_added = 0
-        new_cursors = []
+        new_cursors_asc = []
+        new_cursors_desc = []
         
         with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
-            futures = {executor.submit(self.fetch_page, c): c for c in cursors_to_fetch}
+            futures = {executor.submit(self.fetch_page, c, s): (c, s) for c, s in fetches}
             
             for future in as_completed(futures):
                 try:
-                    servers, next_cursor = future.result()
+                    servers, next_cursor, sort_order = future.result()
                     if servers:
                         added, dupes, dead, total = pool.add_servers(servers, source="fetcher")
                         total_added += added
                     if next_cursor:
-                        new_cursors.append(next_cursor)
+                        if sort_order == 'Asc':
+                            new_cursors_asc.append(next_cursor)
+                        else:
+                            new_cursors_desc.append(next_cursor)
                 except Exception as e:
                     pass
         
-        for c in new_cursors:
-            self.add_cursor(c)
+        # Store new cursors (deeper into the list)
+        with self.cursor_lock:
+            for c in new_cursors_asc:
+                self.cursors_asc.append(c)
+            for c in new_cursors_desc:
+                self.cursors_desc.append(c)
         
         with self.minute_lock:
             self.servers_this_minute += total_added
@@ -326,7 +357,9 @@ class RobloxFetcher:
             if now - self.last_reset >= 60:
                 rate = self.servers_this_minute
                 stats = pool.get_stats()
-                log.info(f"[RATE] +{rate}/min | Pool: {stats['available']} | Seen: {stats['seen_total']} | Given: {stats['total_given']} | Dupes: {stats['duplicates_skipped']}")
+                with self.cursor_lock:
+                    depth = len(self.cursors_asc) + len(self.cursors_desc)
+                log.info(f"[RATE] +{rate}/min | Pool: {stats['available']} | Seen: {stats['seen_total']} | Given: {stats['total_given']} | Depth: {depth}")
                 self.servers_this_minute = 0
                 self.last_reset = now
         
@@ -334,7 +367,7 @@ class RobloxFetcher:
     
     def run(self):
         self.running = True
-        log.info("[FETCHER] Started")
+        log.info("[FETCHER] Started - Deep pagination to find middle servers")
         
         while self.running:
             try:
