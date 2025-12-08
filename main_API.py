@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
 """
-MAIN API - ULTIMATE SERVER HOPPER
-- Deep pagination (5000+ cursors)
-- Both Asc + Desc fetching
-- Smart priority (6-7 players first)
-- Dead server blacklist
-- No duplicate servers to bots
+MAIN API - High Volume Server Pool with NAProxy
 """
 
 import os
@@ -19,24 +14,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 
 # ==================== CONFIG ====================
-SERVER_TTL = 1800  # 30 min
+SERVER_TTL = 1800  # 30 minutes
 PLACE_ID = 109983668079237
 
-# NAProxy
+# NAProxy Config
 PROXY_HOST = "us.naproxy.net"
 PROXY_PORT = "1000"
 PROXY_USER = "proxy-e5a1ntzmrlr3_area-US"
 PROXY_PASS = "Ol43jGdsIuPUNacc"
 
-# Gentle fetching (proxy friendly)
-FETCH_THREADS = 10
-FETCH_INTERVAL = 2
+# Fetching config
+FETCH_THREADS = 20
+FETCH_INTERVAL = 1
 SERVERS_PER_REQUEST = 100
-CURSORS_PER_CYCLE = 50
-MAX_STORED_CURSORS = 1000
-
-# Cooldowns
-GIVEN_COOLDOWN = 90  # Don't re-give server for 90 seconds
+CURSORS_PER_CYCLE = 100
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,7 +40,7 @@ app = Flask(__name__)
 
 # ==================== PROXY ====================
 def get_proxy():
-    session_id = f"main{random.randint(100000, 999999)}"
+    session_id = f"s{random.randint(100000, 999999)}"
     proxy_url = f"http://{PROXY_USER}_session-{session_id}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
     return {'http': proxy_url, 'https': proxy_url}
 
@@ -57,54 +48,55 @@ def get_proxy():
 class ServerPool:
     def __init__(self):
         self._lock = threading.Lock()
-        self._servers = {}  # job_id -> {players, added_time, priority}
-        self._seen_jobs = OrderedDict()  # All seen servers
-        self._dead_servers = set()  # Failed teleports
-        self._given_servers = {}  # job_id -> timestamp
-        
+        self._servers = deque(maxlen=100000)
+        self._seen_jobs = OrderedDict()
+        self._dead_servers = set()
+        self._given_servers = {}
         self._stats = {
             'total_given': 0,
             'total_received': 0,
+            'total_sent_to_us': 0,
+            'expired': 0,
             'duplicates_skipped': 0,
             'dead_skipped': 0,
-            'cooldown_skipped': 0,
-            'low_player_skipped': 0,
             'fetch_errors': 0,
             'fetch_success': 0
         }
     
     def _clean_expired(self):
         now = time.time()
+        expired = 0
         
-        # Remove expired servers
-        expired = [jid for jid, data in self._servers.items() 
-                   if now - data['added_time'] > SERVER_TTL]
-        for jid in expired:
-            del self._servers[jid]
-            if jid in self._seen_jobs:
-                del self._seen_jobs[jid]
+        while self._servers:
+            job_id, players, added_time, priority = self._servers[0]
+            if now - added_time > SERVER_TTL:
+                self._servers.popleft()
+                if job_id in self._seen_jobs:
+                    del self._seen_jobs[job_id]
+                expired += 1
+            else:
+                break
         
-        # Trim seen jobs to prevent memory bloat
-        while len(self._seen_jobs) > 150000:
+        while len(self._seen_jobs) > 50000:
             self._seen_jobs.popitem(last=False)
         
-        # Clean old given servers
-        old_given = [k for k, v in self._given_servers.items() if now - v > GIVEN_COOLDOWN]
+        old_given = [k for k, v in self._given_servers.items() if now - v > SERVER_TTL]
         for k in old_given:
             del self._given_servers[k]
         
-        # Trim dead servers
-        if len(self._dead_servers) > 20000:
-            self._dead_servers = set(list(self._dead_servers)[-10000:])
+        if expired:
+            self._stats['expired'] += expired
+        return expired
     
     def add_servers(self, servers, source="unknown"):
         added = 0
         duplicates = 0
-        low_player = 0
+        dead = 0
         now = time.time()
         
         with self._lock:
             self._clean_expired()
+            self._stats['total_sent_to_us'] += len(servers)
             
             for item in servers:
                 if isinstance(item, str):
@@ -119,108 +111,89 @@ class ServerPool:
                 if not job_id:
                     continue
                 
-                # Skip dead servers
                 if job_id in self._dead_servers:
+                    dead += 1
                     continue
                 
-                # Skip already seen
                 if job_id in self._seen_jobs:
                     duplicates += 1
                     continue
                 
-                # Skip low player servers (less valuable)
-                if players < 5:
-                    low_player += 1
+                if job_id in self._given_servers:
+                    duplicates += 1
                     continue
                 
-                # Skip full servers (8/8)
-                if players >= 8:
-                    continue
-                
-                # Priority scoring
-                if players == 6 or players == 7:
-                    priority = 100  # BEST
-                elif players == 5:
+                # Priority based on player count
+                if players == 5:
                     priority = 50
+                elif players == 6 or players == 7:
+                    priority = 100  # Best
+                elif players == 8:
+                    priority = 20
                 else:
-                    priority = 10
+                    priority = 10  # Less than 5
                 
-                self._servers[job_id] = {
-                    'players': players,
-                    'added_time': now,
-                    'priority': priority
-                }
+                self._servers.append((job_id, players, now, priority))
                 self._seen_jobs[job_id] = now
                 added += 1
             
             self._stats['total_received'] += added
             self._stats['duplicates_skipped'] += duplicates
-            self._stats['low_player_skipped'] += low_player
+            self._stats['dead_skipped'] += dead
         
-        return added, duplicates
+        return added, duplicates, dead, len(servers)
     
-    def get_server(self, bot_id=None):
+    def get_server(self):
         now = time.time()
-        
         with self._lock:
-            self._clean_expired()
+            # Convert to list and sort by priority
+            server_list = list(self._servers)
+            server_list.sort(key=lambda x: x[3], reverse=True)  # Sort by priority (highest first)
             
-            # Build list of available servers
-            available = []
-            cooldown_skipped = 0
-            
-            for job_id, data in self._servers.items():
-                # Skip dead
+            for job_id, players, added_time, priority in server_list:
+                if now - added_time > SERVER_TTL:
+                    self._stats['expired'] += 1
+                    continue
+                
                 if job_id in self._dead_servers:
+                    self._stats['dead_skipped'] += 1
                     continue
                 
-                # Skip recently given (prevent same server to multiple bots)
                 if job_id in self._given_servers:
-                    if now - self._given_servers[job_id] < GIVEN_COOLDOWN:
-                        cooldown_skipped += 1
-                        continue
-                
-                # Skip expired
-                if now - data['added_time'] > SERVER_TTL:
                     continue
                 
-                available.append((job_id, data))
+                # Remove from queue
+                try:
+                    self._servers.remove((job_id, players, added_time, priority))
+                except:
+                    pass
+                
+                self._given_servers[job_id] = now
+                self._stats['total_given'] += 1
+                
+                return {'job_id': job_id, 'players': players, 'priority': priority, 'age': int(now - added_time)}
             
-            self._stats['cooldown_skipped'] += cooldown_skipped
-            
-            if not available:
-                return None
-            
-            # Sort by priority (highest first), then by freshness (newest first)
-            available.sort(key=lambda x: (x[1]['priority'], -x[1]['added_time']), reverse=True)
-            
-            # Get best server
-            job_id, data = available[0]
-            
-            # Mark as given
-            self._given_servers[job_id] = now
-            
-            # Remove from pool
-            del self._servers[job_id]
-            
-            self._stats['total_given'] += 1
-            
-            return {
-                'job_id': job_id,
-                'players': data['players'],
-                'priority': data['priority'],
-                'age': int(now - data['added_time'])
-            }
+            return None
     
-    def report_dead(self, job_id, reason=None):
+    def get_batch(self, count):
+        results = []
+        for _ in range(count):
+            server = self.get_server()
+            if server:
+                results.append(server)
+            else:
+                break
+        return results
+    
+    def report_dead(self, job_id):
         with self._lock:
             self._dead_servers.add(job_id)
-            if job_id in self._servers:
-                del self._servers[job_id]
-            self._stats['dead_skipped'] += 1
+            if len(self._dead_servers) > 10000:
+                self._dead_servers = set(list(self._dead_servers)[-5000:])
     
     def count(self):
         with self._lock:
+            self._clean_expired()
             return len(self._servers)
     
     def record_fetch_error(self):
@@ -234,59 +207,51 @@ class ServerPool:
     def get_stats(self):
         with self._lock:
             self._clean_expired()
-            
-            # Count by priority
-            priority_100 = sum(1 for s in self._servers.values() if s['priority'] == 100)
-            priority_50 = sum(1 for s in self._servers.values() if s['priority'] == 50)
-            
             return {
                 'available': len(self._servers),
-                'priority_6_7': priority_100,
-                'priority_5': priority_50,
                 'seen_total': len(self._seen_jobs),
                 'dead_servers': len(self._dead_servers),
-                'given_cooldown': len(self._given_servers),
+                'given_tracking': len(self._given_servers),
                 'total_given': self._stats['total_given'],
                 'total_received': self._stats['total_received'],
+                'total_sent_to_us': self._stats['total_sent_to_us'],
+                'expired': self._stats['expired'],
                 'duplicates_skipped': self._stats['duplicates_skipped'],
-                'cooldown_skipped': self._stats['cooldown_skipped'],
-                'low_player_skipped': self._stats['low_player_skipped'],
-                'dead_reports': self._stats['dead_skipped'],
+                'dead_skipped': self._stats['dead_skipped'],
                 'fetch_errors': self._stats['fetch_errors'],
-                'fetch_success': self._stats['fetch_success']
+                'fetch_success': self._stats['fetch_success'],
+                'ttl_seconds': SERVER_TTL
             }
 
 pool = ServerPool()
 
-# ==================== DEEP FETCHER ====================
-class DeepFetcher:
+# ==================== ROBLOX FETCHER ====================
+class RobloxFetcher:
     def __init__(self):
         self.running = False
+        self.cursors = deque(maxlen=1000)
         self.cursor_lock = threading.Lock()
-        self.cursors_asc = deque(maxlen=MAX_STORED_CURSORS)
-        self.cursors_desc = deque(maxlen=MAX_STORED_CURSORS)
-        
-        # Stats
         self.last_reset = time.time()
         self.servers_this_minute = 0
-        self.pages_this_minute = 0
+        self.minute_lock = threading.Lock()
     
-    def fetch_page(self, cursor=None, sort_order='Asc'):
+    def fetch_page(self, cursor=None):
         try:
             url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-            params = {'sortOrder': sort_order, 'limit': SERVERS_PER_REQUEST}
+            params = {'sortOrder': 'Asc', 'limit': SERVERS_PER_REQUEST}
             if cursor:
                 params['cursor'] = cursor
+            
+            proxies = get_proxy()
             
             response = requests.get(
                 url,
                 params=params,
-                proxies=get_proxy(),
+                proxies=proxies,
                 timeout=10,
                 headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'application/json',
-                    'Accept-Language': 'en-US,en;q=0.9'
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json'
                 }
             )
             
@@ -295,100 +260,63 @@ class DeepFetcher:
                 servers = data.get('data', [])
                 next_cursor = data.get('nextPageCursor')
                 pool.record_fetch_success()
-                return servers, next_cursor, sort_order
+                return servers, next_cursor
             elif response.status_code == 429:
-                time.sleep(1)
-                return [], None, sort_order
+                time.sleep(0.5)
+                return [], None
             else:
                 pool.record_fetch_error()
-                return [], None, sort_order
+                return [], None
                 
         except Exception as e:
             pool.record_fetch_error()
-            return [], None, sort_order
+            return [], None
+    
+    def add_cursor(self, cursor):
+        if cursor:
+            with self.cursor_lock:
+                self.cursors.append(cursor)
     
     def fetch_cycle(self):
-        fetches = []
-        
-        # Always start fresh (both directions)
-        fetches.append((None, 'Asc'))
-        fetches.append((None, 'Desc'))
-        
-        # Sample cursors from different depths
+        cursors_to_fetch = [None]
         with self.cursor_lock:
-            asc_list = list(self.cursors_asc)
-            desc_list = list(self.cursors_desc)
-            
-            # Sample evenly across all depths for Asc
-            if asc_list:
-                step = max(1, len(asc_list) // 60)
-                for i in range(0, len(asc_list), step):
-                    fetches.append((asc_list[i], 'Asc'))
-            
-            # Sample evenly across all depths for Desc
-            if desc_list:
-                step = max(1, len(desc_list) // 60)
-                for i in range(0, len(desc_list), step):
-                    fetches.append((desc_list[i], 'Desc'))
-        
-        # Limit per cycle
-        fetches = fetches[:CURSORS_PER_CYCLE]
+            cursors_to_fetch.extend(list(self.cursors)[:CURSORS_PER_CYCLE - 1])
         
         total_added = 0
-        new_cursors_asc = []
-        new_cursors_desc = []
-        pages_fetched = 0
+        new_cursors = []
         
-        # Execute in parallel
         with ThreadPoolExecutor(max_workers=FETCH_THREADS) as executor:
-            futures = {executor.submit(self.fetch_page, c, s): (c, s) for c, s in fetches}
+            futures = {executor.submit(self.fetch_page, c): c for c in cursors_to_fetch}
             
             for future in as_completed(futures):
                 try:
-                    servers, next_cursor, sort_order = future.result()
-                    pages_fetched += 1
-                    
+                    servers, next_cursor = future.result()
                     if servers:
-                        added, _ = pool.add_servers(servers, source=f"main-{sort_order}")
+                        added, dupes, dead, total = pool.add_servers(servers, source="fetcher")
                         total_added += added
-                    
                     if next_cursor:
-                        if sort_order == 'Asc':
-                            new_cursors_asc.append(next_cursor)
-                        else:
-                            new_cursors_desc.append(next_cursor)
-                except:
+                        new_cursors.append(next_cursor)
+                except Exception as e:
                     pass
         
-        # Store new cursors for deeper fetching
-        with self.cursor_lock:
-            for c in new_cursors_asc:
-                self.cursors_asc.append(c)
-            for c in new_cursors_desc:
-                self.cursors_desc.append(c)
+        for c in new_cursors:
+            self.add_cursor(c)
         
-        # Stats logging
-        self.servers_this_minute += total_added
-        self.pages_this_minute += pages_fetched
-        
-        now = time.time()
-        if now - self.last_reset >= 60:
-            stats = pool.get_stats()
-            with self.cursor_lock:
-                cursor_count = len(self.cursors_asc) + len(self.cursors_desc)
-            
-            log.info(f"[MAIN] +{self.servers_this_minute}/min | Pool: {stats['available']} (6-7: {stats['priority_6_7']}) | Pages: {self.pages_this_minute} | Cursors: {cursor_count} | Given: {stats['total_given']}")
-            
-            self.servers_this_minute = 0
-            self.pages_this_minute = 0
-            self.last_reset = now
+        with self.minute_lock:
+            self.servers_this_minute += total_added
+            now = time.time()
+            if now - self.last_reset >= 60:
+                rate = self.servers_this_minute
+                stats = pool.get_stats()
+                log.info(f"[RATE] +{rate}/min | Pool: {stats['available']} | Seen: {stats['seen_total']} | Given: {stats['total_given']} | Dupes: {stats['duplicates_skipped']}")
+                self.servers_this_minute = 0
+                self.last_reset = now
         
         return total_added
     
     def run(self):
         self.running = True
-        log.info("[MAIN FETCHER] Started - Deep pagination enabled")
-        log.info(f"[CONFIG] Threads: {FETCH_THREADS} | Interval: {FETCH_INTERVAL}s | Cursors/cycle: {CURSORS_PER_CYCLE} | Max cursors: {MAX_STORED_CURSORS}")
+        log.info("[FETCHER] Started")
         
         while self.running:
             try:
@@ -401,7 +329,7 @@ class DeepFetcher:
         thread = threading.Thread(target=self.run, daemon=True)
         thread.start()
 
-fetcher = DeepFetcher()
+fetcher = RobloxFetcher()
 
 # ==================== API ENDPOINTS ====================
 
@@ -409,27 +337,24 @@ fetcher = DeepFetcher()
 def status():
     stats = pool.get_stats()
     with fetcher.cursor_lock:
-        stats['cursors_asc'] = len(fetcher.cursors_asc)
-        stats['cursors_desc'] = len(fetcher.cursors_desc)
-        stats['cursors_total'] = stats['cursors_asc'] + stats['cursors_desc']
+        stats['cursors_cached'] = len(fetcher.cursors)
     return jsonify(stats)
 
 @app.route('/get-server', methods=['GET'])
 def get_server():
-    bot_id = request.args.get('bot_id', 'unknown')
-    server = pool.get_server(bot_id=bot_id)
+    server = pool.get_server()
     if not server:
         return jsonify({'error': 'No servers available'}), 404
     return jsonify(server)
 
-@app.route('/report-dead', methods=['POST'])
-def report_dead():
-    data = request.get_json() or {}
-    job_id = data.get('job_id')
-    reason = data.get('reason', 'unknown')
-    if job_id:
-        pool.report_dead(job_id, reason)
-    return jsonify({'status': 'noted'})
+@app.route('/get-batch', methods=['GET'])
+def get_batch():
+    count = request.args.get('count', default=100, type=int)
+    count = min(count, 200)
+    servers = pool.get_batch(count)
+    if not servers:
+        return jsonify({'servers': [], 'count': 0}), 200
+    return jsonify({'servers': servers, 'count': len(servers)})
 
 @app.route('/add-pool', methods=['POST'])
 def add_pool():
@@ -440,42 +365,28 @@ def add_pool():
     if not servers:
         return jsonify({'added': 0}), 200
     
-    added, dupes = pool.add_servers(servers, source=source)
-    return jsonify({
-        'added': added,
-        'duplicates': dupes,
-        'pool_size': pool.count()
-    })
+    added, dupes, dead, total = pool.add_servers(servers, source=source)
+    log.info(f"[RECEIVE] {source}: {total} sent -> {added} new, {dupes} dupes, {dead} dead | Pool: {pool.count()}")
+    return jsonify({'added': added, 'duplicates': dupes, 'dead': dead, 'pool_size': pool.count()})
+
+@app.route('/report-dead', methods=['POST'])
+def report_dead():
+    data = request.get_json() or {}
+    job_id = data.get('job_id')
+    if job_id:
+        pool.report_dead(job_id)
+    return jsonify({'status': 'noted'})
 
 @app.route('/health', methods=['GET'])
 def health():
-    stats = pool.get_stats()
-    return jsonify({
-        'status': 'ok',
-        'servers': stats['available'],
-        'given': stats['total_given']
-    })
-
-@app.route('/', methods=['GET'])
-def root():
-    return jsonify({
-        'service': 'Main API - Ultimate Server Hopper',
-        'status': 'running',
-        'servers': pool.count()
-    })
+    return jsonify({'status': 'ok', 'servers': pool.count()})
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     
-    log.info("=" * 60)
-    log.info("  MAIN API - ULTIMATE SERVER HOPPER")
-    log.info("=" * 60)
-    log.info(f"  Port: {port}")
-    log.info(f"  Fetch Threads: {FETCH_THREADS}")
-    log.info(f"  Max Cursors: {MAX_STORED_CURSORS}")
-    log.info(f"  Server TTL: {SERVER_TTL}s")
-    log.info("=" * 60)
+    log.info(f"[STARTUP] Main API on port {port}")
+    log.info(f"[CONFIG] TTL={SERVER_TTL}s | Threads={FETCH_THREADS}")
     
     fetcher.start()
     time.sleep(2)
