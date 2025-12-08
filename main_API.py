@@ -133,13 +133,15 @@ class ServerPool:
                     low_player += 1
                     continue
                 
+                # Skip full servers (8/8)
+                if players >= 8:
+                    continue
+                
                 # Priority scoring
                 if players == 6 or players == 7:
                     priority = 100  # BEST
                 elif players == 5:
                     priority = 50
-                elif players == 8:
-                    priority = 30
                 else:
                     priority = 10
                 
@@ -236,13 +238,11 @@ class ServerPool:
             # Count by priority
             priority_100 = sum(1 for s in self._servers.values() if s['priority'] == 100)
             priority_50 = sum(1 for s in self._servers.values() if s['priority'] == 50)
-            priority_30 = sum(1 for s in self._servers.values() if s['priority'] == 30)
             
             return {
                 'available': len(self._servers),
                 'priority_6_7': priority_100,
                 'priority_5': priority_50,
-                'priority_8': priority_30,
                 'seen_total': len(self._seen_jobs),
                 'dead_servers': len(self._dead_servers),
                 'given_cooldown': len(self._given_servers),
@@ -481,4 +481,3 @@ if __name__ == '__main__':
     time.sleep(2)
     
     app.run(host='0.0.0.0', port=port, threaded=True, debug=False)
-
