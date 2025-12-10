@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-MAIN API - Static IPs with Residential Fallback
-- 4 Static IPs as primary
-- Residential proxy fallback when rate limited
-- Auto timezone detection
-- Peak hours: 5-8 PM local time
+MAIN API - NAProxy API Integration
+- Fetches fresh residential IPs via NAProxy API
+- Smart Region for best routing
+- Auto-refreshes IP pool
+- No static IPs needed
 """
 
 import os
@@ -18,38 +18,39 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import random
 
 # ==================== CONFIG ====================
-SERVER_TTL = 300  # 5 minutes
+SERVER_TTL = 300
 GIVEN_TTL = 300
 PLACE_ID = 109983668079237
 
-# Static IPs (Primary - faster, limited)
-STATIC_IPS = [
-    {"host": "45.82.245.107", "port": "6006", "user": "proxy-jjvnubn4uo17", "pass": "CeNOkLV1A3ObkRy4"},
-    {"host": "163.171.161.247", "port": "6006", "user": "proxy-jjvnubn4uo17", "pass": "CeNOkLV1A3ObkRy4"},
-    {"host": "43.153.175.48", "port": "6006", "user": "proxy-jjvnubn4uo17", "pass": "CeNOkLV1A3ObkRy4"},
-    {"host": "185.92.209.125", "port": "6006", "user": "proxy-jjvnubn4uo17", "pass": "CeNOkLV1A3ObkRy4"},
-]
+# NAProxy API Config
+NAPROXY_API_KEY = "b6e6673dfb2404d26759eddd1bdf9d12"
+NAPROXY_API_URL = "https://api.naproxy.com/web_v1/ip/get-ip-v3"
 
-# Residential Proxy (Fallback - unlimited IPs)
-RESIDENTIAL_PROXY = {
-    "host": "us.naproxy.net",
-    "port": "1000",
-    "user": "proxy-e5a1ntzmrlr3",
-    "pass": "Ol43jGdsIuPUNacc"
-}
+# Proxy settings
+PROXY_COUNT = 20          # IPs to fetch per batch
+PROXY_LIFE = 30           # Session life in seconds
+PROXY_PROTOCOL = 1        # 1 = HTTPS/SOCKS5
+PROXY_REGION = "Smart Region"
+PROXY_COUNTRY = ""        # Empty = random
+PROXY_STATE = ""
+PROXY_CITY = ""
 
-# Peak hours (5 PM - 8 PM in detected timezone)
+# How often to refresh proxy pool
+PROXY_REFRESH_INTERVAL = 25  # Refresh before they expire (30s life)
+MIN_PROXIES = 10             # Fetch more when below this
+
+# Peak hours
 PEAK_START_HOUR = 17
 PEAK_END_HOUR = 20
 
 # Fetching config
-FETCH_THREADS_PEAK = 16
-FETCH_THREADS_NORMAL = 6
+FETCH_THREADS_PEAK = 20
+FETCH_THREADS_NORMAL = 10
 FETCH_INTERVAL_PEAK = 1
-FETCH_INTERVAL_NORMAL = 3
+FETCH_INTERVAL_NORMAL = 2
 SERVERS_PER_REQUEST = 100
-CURSORS_PER_CYCLE_PEAK = 50
-CURSORS_PER_CYCLE_NORMAL = 20
+CURSORS_PER_CYCLE_PEAK = 60
+CURSORS_PER_CYCLE_NORMAL = 30
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,71 +64,35 @@ app = Flask(__name__)
 # ==================== AUTO TIMEZONE ====================
 class TimezoneDetector:
     def __init__(self):
-        self.timezone = None
-        self.utc_offset = 0
-        self.detected = False
+        self.timezone = 'America/New_York'
+        self.utc_offset = -5
         self._detect()
     
     def _detect(self):
-        """Auto-detect timezone from multiple sources"""
-        # Method 1: Try IP geolocation
         try:
             resp = requests.get('http://ip-api.com/json/', timeout=5)
             if resp.ok:
                 data = resp.json()
                 self.timezone = data.get('timezone', 'America/New_York')
                 self.utc_offset = self._get_offset(self.timezone)
-                self.detected = True
-                log.info(f"[TIMEZONE] Detected: {self.timezone} (UTC{self.utc_offset:+d})")
+                log.info(f"[TIMEZONE] {self.timezone} (UTC{self.utc_offset:+d})")
                 return
         except:
             pass
-        
-        # Method 2: Try worldtimeapi
-        try:
-            resp = requests.get('http://worldtimeapi.org/api/ip', timeout=5)
-            if resp.ok:
-                data = resp.json()
-                self.timezone = data.get('timezone', 'America/New_York')
-                self.utc_offset = int(data.get('utc_offset', '-05:00').split(':')[0])
-                self.detected = True
-                log.info(f"[TIMEZONE] Detected: {self.timezone} (UTC{self.utc_offset:+d})")
-                return
-        except:
-            pass
-        
-        # Fallback to EST
-        self.timezone = 'America/New_York'
-        self.utc_offset = -5
-        log.info(f"[TIMEZONE] Fallback: {self.timezone} (UTC{self.utc_offset:+d})")
     
     def _get_offset(self, tz_name):
-        """Get UTC offset for timezone"""
-        try:
-            import pytz
-            from datetime import datetime
-            tz = pytz.timezone(tz_name)
-            now = datetime.now(tz)
-            return int(now.utcoffset().total_seconds() / 3600)
-        except:
-            # Common timezone offsets
-            offsets = {
-                'America/New_York': -5, 'America/Chicago': -6,
-                'America/Denver': -7, 'America/Los_Angeles': -8,
-                'Europe/London': 0, 'Europe/Paris': 1,
-                'Asia/Tokyo': 9, 'Australia/Sydney': 11
-            }
-            return offsets.get(tz_name, -5)
+        offsets = {
+            'America/New_York': -5, 'America/Chicago': -6,
+            'America/Denver': -7, 'America/Los_Angeles': -8,
+            'Europe/London': 0, 'Europe/Paris': 1,
+        }
+        return offsets.get(tz_name, -5)
     
     def get_local_hour(self):
-        """Get current hour in detected timezone"""
-        import time
         utc_hour = time.gmtime().tm_hour
-        local_hour = (utc_hour + self.utc_offset) % 24
-        return local_hour
+        return (utc_hour + self.utc_offset) % 24
     
     def is_peak(self):
-        """Check if current time is peak hours (5-8 PM local)"""
         hour = self.get_local_hour()
         return PEAK_START_HOUR <= hour < PEAK_END_HOUR
 
@@ -151,136 +116,180 @@ def get_fetch_config():
         'mode': 'NORMAL'
     }
 
-# ==================== SMART IP ROTATION ====================
-class SmartIPRotator:
-    def __init__(self, static_ips, residential):
-        self.static_ips = static_ips
-        self.residential = residential
-        self.static_index = 0
+# ==================== NAPROXY IP POOL ====================
+class NAProxyPool:
+    def __init__(self):
         self.lock = threading.Lock()
-        
-        # Track each static IP
-        self.static_status = {}
-        for i, ip in enumerate(static_ips):
-            self.static_status[i] = {
-                'usage': 0,
-                'success': 0,
-                'errors': 0,
-                'last_error': 0,
-                'cooldown_until': 0,
-                'consecutive_errors': 0
-            }
-        
-        # Track residential usage
-        self.residential_stats = {
-            'usage': 0,
-            'success': 0,
-            'errors': 0,
-            'fallback_count': 0
+        self.proxies = deque()  # (proxy_url, expire_time)
+        self.last_fetch = 0
+        self.stats = {
+            'api_calls': 0,
+            'ips_fetched': 0,
+            'ips_used': 0,
+            'ips_expired': 0,
+            'api_errors': 0,
+            'request_success': 0,
+            'request_errors': 0
         }
+        
+        # Start background refresh thread
+        self.running = True
+        self.refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
+        self.refresh_thread.start()
     
-    def _build_proxy_url(self, ip_config, session_id=None):
-        """Build proxy URL from config"""
-        user = ip_config['user']
-        if session_id:
-            user = f"{user}_session-{session_id}"
-        return f"http://{user}:{ip_config['pass']}@{ip_config['host']}:{ip_config['port']}"
+    def _fetch_proxies(self):
+        """Fetch fresh proxies from NAProxy API"""
+        try:
+            params = {
+                'app_key': NAPROXY_API_KEY,
+                'pt': 9,  # Proxy type
+                'num': PROXY_COUNT,
+                'cc': PROXY_COUNTRY,
+                'state': PROXY_STATE,
+                'city': PROXY_CITY,
+                'life': PROXY_LIFE,
+                'protocol': PROXY_PROTOCOL,
+                'format': 'txt',
+                'lb': '%5Cr%5Cn'  # \r\n separator
+            }
+            
+            # Add sep parameter for Smart Region
+            params['sep'] = ''
+            
+            resp = requests.get(NAPROXY_API_URL, params=params, timeout=10)
+            
+            if resp.ok:
+                text = resp.text.strip()
+                if text and not text.startswith('{'):  # Not an error JSON
+                    lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+                    proxies = []
+                    expire_time = time.time() + PROXY_LIFE
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if line and ':' in line:
+                            # Format: ip:port or ip:port:user:pass
+                            parts = line.split(':')
+                            if len(parts) >= 2:
+                                proxy_url = f"http://{line}"
+                                proxies.append((proxy_url, expire_time))
+                    
+                    with self.lock:
+                        self.stats['api_calls'] += 1
+                        self.stats['ips_fetched'] += len(proxies)
+                        for p in proxies:
+                            self.proxies.append(p)
+                    
+                    log.info(f"[NAPROXY] Fetched {len(proxies)} fresh IPs (pool: {len(self.proxies)})")
+                    return len(proxies)
+                else:
+                    log.warning(f"[NAPROXY] API response: {text[:100]}")
+            else:
+                log.error(f"[NAPROXY] API error: {resp.status_code}")
+                with self.lock:
+                    self.stats['api_errors'] += 1
+                    
+        except Exception as e:
+            log.error(f"[NAPROXY] Fetch error: {e}")
+            with self.lock:
+                self.stats['api_errors'] += 1
+        
+        return 0
+    
+    def _cleanup_expired(self):
+        """Remove expired proxies"""
+        now = time.time()
+        expired = 0
+        
+        with self.lock:
+            while self.proxies and self.proxies[0][1] < now:
+                self.proxies.popleft()
+                expired += 1
+            
+            if expired:
+                self.stats['ips_expired'] += expired
+        
+        return expired
+    
+    def _refresh_loop(self):
+        """Background thread to keep proxy pool fresh"""
+        while self.running:
+            try:
+                self._cleanup_expired()
+                
+                with self.lock:
+                    pool_size = len(self.proxies)
+                
+                # Fetch more if running low
+                if pool_size < MIN_PROXIES:
+                    self._fetch_proxies()
+                
+                time.sleep(5)  # Check every 5 seconds
+                
+            except Exception as e:
+                log.error(f"[NAPROXY] Refresh error: {e}")
+                time.sleep(1)
     
     def get_proxy(self):
-        """Get best available proxy - static first, residential fallback"""
+        """Get a proxy from the pool"""
+        self._cleanup_expired()
+        
         with self.lock:
-            now = time.time()
-            
-            # Try static IPs first (round-robin, skip cooldowns)
-            for _ in range(len(self.static_ips)):
-                idx = self.static_index
-                self.static_index = (self.static_index + 1) % len(self.static_ips)
-                status = self.static_status[idx]
-                
-                # Skip if on cooldown
-                if now < status['cooldown_until']:
-                    continue
-                
-                # Use this static IP
-                status['usage'] += 1
-                ip_config = self.static_ips[idx]
-                proxy_url = self._build_proxy_url(ip_config)
-                
-                return {
-                    'http': proxy_url,
-                    'https': proxy_url
-                }, 'static', idx
-            
-            # All static IPs on cooldown - use residential
-            self.residential_stats['usage'] += 1
-            self.residential_stats['fallback_count'] += 1
-            
-            session_id = f"s{random.randint(100000, 999999)}"
-            proxy_url = self._build_proxy_url(self.residential, session_id)
-            
-            return {
-                'http': proxy_url,
-                'https': proxy_url
-            }, 'residential', -1
-    
-    def report_success(self, proxy_type, idx):
-        """Report successful request"""
-        with self.lock:
-            if proxy_type == 'static' and idx >= 0:
-                status = self.static_status[idx]
-                status['success'] += 1
-                status['consecutive_errors'] = 0
-                # Reduce cooldown on success
-                if status['cooldown_until'] > 0:
-                    status['cooldown_until'] = max(0, status['cooldown_until'] - 10)
+            if not self.proxies:
+                # Pool empty, fetch synchronously
+                pass
             else:
-                self.residential_stats['success'] += 1
-    
-    def report_error(self, proxy_type, idx, is_rate_limit=False):
-        """Report failed request"""
-        with self.lock:
-            now = time.time()
-            
-            if proxy_type == 'static' and idx >= 0:
-                status = self.static_status[idx]
-                status['errors'] += 1
-                status['last_error'] = now
-                status['consecutive_errors'] += 1
+                # Get random proxy from pool (don't remove, can reuse within lifetime)
+                idx = random.randint(0, len(self.proxies) - 1)
+                proxy_url, expire_time = self.proxies[idx]
                 
-                # Progressive cooldown based on consecutive errors
-                if is_rate_limit or status['consecutive_errors'] >= 2:
-                    # 30s base + 15s per consecutive error (max 2 min)
-                    cooldown = min(30 + (status['consecutive_errors'] * 15), 120)
-                    status['cooldown_until'] = now + cooldown
-                    log.warning(f"[IP] Static #{idx} cooldown {cooldown}s (errors: {status['consecutive_errors']})")
-            else:
-                self.residential_stats['errors'] += 1
+                # Skip if about to expire (< 5s left)
+                if expire_time - time.time() > 5:
+                    self.stats['ips_used'] += 1
+                    return {'http': proxy_url, 'https': proxy_url}
+        
+        # Fetch fresh if needed
+        self._fetch_proxies()
+        
+        with self.lock:
+            if self.proxies:
+                proxy_url, _ = self.proxies[0]
+                self.stats['ips_used'] += 1
+                return {'http': proxy_url, 'https': proxy_url}
+        
+        return None
+    
+    def report_success(self):
+        with self.lock:
+            self.stats['request_success'] += 1
+    
+    def report_error(self, proxy_url=None):
+        with self.lock:
+            self.stats['request_errors'] += 1
+            
+            # Remove bad proxy from pool
+            if proxy_url:
+                self.proxies = deque(
+                    (p, e) for p, e in self.proxies if p != proxy_url
+                )
     
     def get_stats(self):
-        """Get rotation statistics"""
         with self.lock:
-            now = time.time()
-            static_stats = []
-            
-            for i, status in self.static_status.items():
-                ip = self.static_ips[i]['host']
-                cooldown_remaining = max(0, int(status['cooldown_until'] - now))
-                static_stats.append({
-                    'ip': ip,
-                    'usage': status['usage'],
-                    'success': status['success'],
-                    'errors': status['errors'],
-                    'cooldown': cooldown_remaining,
-                    'active': cooldown_remaining == 0
-                })
-            
             return {
-                'static': static_stats,
-                'residential': self.residential_stats.copy(),
-                'active_static': sum(1 for s in static_stats if s['active'])
+                'pool_size': len(self.proxies),
+                'api_calls': self.stats['api_calls'],
+                'ips_fetched': self.stats['ips_fetched'],
+                'ips_used': self.stats['ips_used'],
+                'ips_expired': self.stats['ips_expired'],
+                'api_errors': self.stats['api_errors'],
+                'request_success': self.stats['request_success'],
+                'request_errors': self.stats['request_errors'],
+                'success_rate': round(
+                    self.stats['request_success'] / max(1, self.stats['request_success'] + self.stats['request_errors']) * 100, 1
+                )
             }
 
-ip_rotator = SmartIPRotator(STATIC_IPS, RESIDENTIAL_PROXY)
+proxy_pool = NAProxyPool()
 
 # ==================== SERVER POOL ====================
 class ServerPool:
@@ -295,8 +304,6 @@ class ServerPool:
             'recycled': 0,
             'duplicates_skipped': 0,
             'dead_skipped': 0,
-            'fetch_errors': 0,
-            'fetch_success': 0,
             'peak_servers': 0,
             'normal_servers': 0
         }
@@ -320,8 +327,6 @@ class ServerPool:
         expired_available = [k for k, (p, t, pr) in self._available.items() if now - t > SERVER_TTL]
         for k in expired_available:
             del self._available[k]
-        
-        return recycled
     
     def add_servers(self, servers, source="unknown"):
         added = 0
@@ -350,11 +355,7 @@ class ServerPool:
                     dead += 1
                     continue
                 
-                if job_id in self._assigned:
-                    duplicates += 1
-                    continue
-                
-                if job_id in self._available:
+                if job_id in self._assigned or job_id in self._available:
                     duplicates += 1
                     continue
                 
@@ -455,28 +456,17 @@ class ServerPool:
         with self._lock:
             now = time.time()
             self._dead[job_id] = now
-            if job_id in self._available:
-                del self._available[job_id]
-            if job_id in self._assigned:
-                del self._assigned[job_id]
+            self._available.pop(job_id, None)
+            self._assigned.pop(job_id, None)
     
     def release_server(self, job_id):
         with self._lock:
-            if job_id in self._assigned:
-                del self._assigned[job_id]
+            self._assigned.pop(job_id, None)
     
     def count(self):
         with self._lock:
             self._cleanup()
             return len(self._available)
-    
-    def record_fetch_error(self):
-        with self._lock:
-            self._stats['fetch_errors'] += 1
-    
-    def record_fetch_success(self):
-        with self._lock:
-            self._stats['fetch_success'] += 1
     
     def get_stats(self):
         with self._lock:
@@ -490,8 +480,6 @@ class ServerPool:
                 'recycled': self._stats['recycled'],
                 'duplicates_skipped': self._stats['duplicates_skipped'],
                 'dead_skipped': self._stats['dead_skipped'],
-                'fetch_errors': self._stats['fetch_errors'],
-                'fetch_success': self._stats['fetch_success'],
                 'peak_servers': self._stats['peak_servers'],
                 'normal_servers': self._stats['normal_servers'],
                 'ttl_seconds': SERVER_TTL
@@ -511,60 +499,50 @@ class RobloxFetcher:
         self.minute_lock = threading.Lock()
     
     def fetch_page(self, cursor=None, sort_order='Asc'):
-        max_retries = 2
-        proxy, proxy_type, ip_idx = ip_rotator.get_proxy()
+        proxy = proxy_pool.get_proxy()
+        if not proxy:
+            return [], None, sort_order
         
-        for attempt in range(max_retries):
-            try:
-                url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
-                params = {
-                    'sortOrder': sort_order,
-                    'limit': SERVERS_PER_REQUEST,
-                    'excludeFullGames': 'true'
+        proxy_url = proxy.get('http', '')
+        
+        try:
+            url = f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public"
+            params = {
+                'sortOrder': sort_order,
+                'limit': SERVERS_PER_REQUEST,
+                'excludeFullGames': 'true'
+            }
+            if cursor:
+                params['cursor'] = cursor
+            
+            response = requests.get(
+                url,
+                params=params,
+                proxies=proxy,
+                timeout=15,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json'
                 }
-                if cursor:
-                    params['cursor'] = cursor
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                servers = data.get('data', [])
+                next_cursor = data.get('nextPageCursor')
+                proxy_pool.report_success()
+                return servers, next_cursor, sort_order
                 
-                response = requests.get(
-                    url,
-                    params=params,
-                    proxies=proxy,
-                    timeout=15,
-                    headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                        'Accept': 'application/json'
-                    }
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    servers = data.get('data', [])
-                    next_cursor = data.get('nextPageCursor')
-                    pool.record_fetch_success()
-                    ip_rotator.report_success(proxy_type, ip_idx)
-                    return servers, next_cursor, sort_order
-                    
-                elif response.status_code == 429:
-                    ip_rotator.report_error(proxy_type, ip_idx, is_rate_limit=True)
-                    # Get new proxy for retry
-                    proxy, proxy_type, ip_idx = ip_rotator.get_proxy()
-                    time.sleep(1)
-                    continue
-                else:
-                    pool.record_fetch_error()
-                    ip_rotator.report_error(proxy_type, ip_idx)
-                    return [], None, sort_order
-                    
-            except Exception as e:
-                ip_rotator.report_error(proxy_type, ip_idx)
-                if attempt < max_retries - 1:
-                    proxy, proxy_type, ip_idx = ip_rotator.get_proxy()
-                    time.sleep(0.5)
-                    continue
-                pool.record_fetch_error()
+            elif response.status_code == 429:
+                proxy_pool.report_error(proxy_url)
                 return [], None, sort_order
-        
-        return [], None, sort_order
+            else:
+                proxy_pool.report_error(proxy_url)
+                return [], None, sort_order
+                
+        except Exception as e:
+            proxy_pool.report_error(proxy_url)
+            return [], None, sort_order
     
     def fetch_cycle(self):
         config = get_fetch_config()
@@ -577,7 +555,7 @@ class RobloxFetcher:
             asc_list = list(self.cursors_asc)
             desc_list = list(self.cursors_desc)
             
-            depth = 30 if config['mode'] == 'PEAK' else 15
+            depth = 35 if config['mode'] == 'PEAK' else 20
             
             if asc_list:
                 for c in asc_list[-min(depth, len(asc_list)):]:
@@ -600,7 +578,7 @@ class RobloxFetcher:
                 try:
                     servers, next_cursor, sort_order = future.result()
                     if servers:
-                        added, dupes, dead, total = pool.add_servers(servers, source="fetcher")
+                        added, _, _, _ = pool.add_servers(servers, source="fetcher")
                         total_added += added
                     if next_cursor:
                         if sort_order == 'Asc':
@@ -622,10 +600,10 @@ class RobloxFetcher:
             if now - self.last_reset >= 60:
                 rate = self.servers_this_minute
                 stats = pool.get_stats()
-                ip_stats = ip_rotator.get_stats()
+                proxy_stats = proxy_pool.get_stats()
                 with self.cursor_lock:
                     depth = len(self.cursors_asc) + len(self.cursors_desc)
-                log.info(f"[{config['mode']}] +{rate}/min | Avail: {stats['available']} | Given: {stats['total_given']} | Static: {ip_stats['active_static']}/4 | Resi: {ip_stats['residential']['fallback_count']}")
+                log.info(f"[{config['mode']}] +{rate}/min | Avail: {stats['available']} | Given: {stats['total_given']} | Proxies: {proxy_stats['pool_size']} | Success: {proxy_stats['success_rate']}%")
                 self.servers_this_minute = 0
                 self.last_reset = now
         
@@ -633,8 +611,8 @@ class RobloxFetcher:
     
     def run(self):
         self.running = True
-        log.info(f"[FETCHER] Started - 4 Static IPs + Residential fallback")
-        log.info(f"[FETCHER] Peak hours: {PEAK_START_HOUR}:00-{PEAK_END_HOUR}:00 ({tz_detector.timezone})")
+        log.info(f"[FETCHER] Started with NAProxy API")
+        log.info(f"[FETCHER] Peak: {PEAK_START_HOUR}:00-{PEAK_END_HOUR}:00 ({tz_detector.timezone})")
         
         while self.running:
             try:
@@ -657,7 +635,7 @@ fetcher = RobloxFetcher()
 def status():
     stats = pool.get_stats()
     config = get_fetch_config()
-    ip_stats = ip_rotator.get_stats()
+    proxy_stats = proxy_pool.get_stats()
     
     with fetcher.cursor_lock:
         stats['cursors_asc'] = len(fetcher.cursors_asc)
@@ -668,9 +646,8 @@ def status():
     stats['local_hour'] = tz_detector.get_local_hour()
     stats['timezone'] = tz_detector.timezone
     stats['peak_hours'] = f"{PEAK_START_HOUR}:00-{PEAK_END_HOUR}:00"
-    stats['ip_stats'] = ip_stats
+    stats['proxy'] = proxy_stats
     stats['threads'] = config['threads']
-    stats['interval'] = config['interval']
     
     return jsonify(stats)
 
@@ -702,8 +679,7 @@ def add_pool():
         return jsonify({'added': 0}), 200
     
     added, dupes, dead, total = pool.add_servers(servers, source=source)
-    config = get_fetch_config()
-    log.info(f"[{config['mode']}] {source}: +{added} new | Avail: {pool.count()}")
+    log.info(f"[RECEIVE] {source}: +{added} | Avail: {pool.count()}")
     return jsonify({
         'added': added,
         'duplicates': dupes,
@@ -730,18 +706,19 @@ def release():
 @app.route('/health', methods=['GET'])
 def health():
     config = get_fetch_config()
+    proxy_stats = proxy_pool.get_stats()
     return jsonify({
         'status': 'ok',
         'available': pool.count(),
         'mode': config['mode'],
-        'is_peak': is_peak_hours(),
+        'proxies': proxy_stats['pool_size'],
         'local_hour': tz_detector.get_local_hour()
     })
 
-@app.route('/ips', methods=['GET'])
-def get_ip_status():
-    """View detailed IP status"""
-    return jsonify(ip_rotator.get_stats())
+@app.route('/proxy', methods=['GET'])
+def proxy_status():
+    """Detailed proxy stats"""
+    return jsonify(proxy_pool.get_stats())
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
@@ -749,8 +726,11 @@ if __name__ == '__main__':
     
     log.info(f"[STARTUP] Main API on port {port}")
     log.info(f"[CONFIG] TTL={SERVER_TTL}s | Peak={PEAK_START_HOUR}-{PEAK_END_HOUR}")
-    log.info(f"[CONFIG] 4 Static IPs + Residential fallback")
-    log.info(f"[TIMEZONE] {tz_detector.timezone} (UTC{tz_detector.utc_offset:+d})")
+    log.info(f"[NAPROXY] Using API with Smart Region")
+    
+    # Pre-fetch some proxies
+    log.info("[NAPROXY] Fetching initial proxy pool...")
+    proxy_pool._fetch_proxies()
     
     fetcher.start()
     time.sleep(2)
