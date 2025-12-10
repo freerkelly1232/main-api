@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 MAIN API - UK/Brazil/US Peak Hour Rotation
-- Switches between UK, Brazil, US based on where it's 5-8 PM
-- Uses NAProxy API for fresh residential IPs
+Fixed for SOCKS5 proxies from NAProxy
 """
 
 import os
@@ -22,8 +21,8 @@ GIVEN_TTL = 300
 PLACE_ID = 109983668079237
 
 # NAProxy API
-NAPROXY_API_URL = "https://api.naproxy.com/web_v1/ip/get-ip-v3"
-NAPROXY_API_KEY = "b6e6673dfb2404d26759eddd1bdf9d12"
+NAPROXY_BASE = "https://api.naproxy.com/web_v1/ip/get-ip-v3"
+NAPROXY_KEY = "b6e6673dfb2404d26759eddd1bdf9d12"
 
 # Proxy settings
 PROXY_COUNT = 20
@@ -31,13 +30,13 @@ PROXY_LIFE = 30
 MIN_PROXIES = 10
 
 # Peak hours
-PEAK_START = 17  # 5 PM
-PEAK_END = 20    # 8 PM
+PEAK_START = 17
+PEAK_END = 20
 
-# Target regions - UK, Brazil, US (East/Central/West)
+# Regions
 REGIONS = [
-    {"name": "UK", "cc": "GB", "utc_offset": 0},
-    {"name": "Brazil", "cc": "BR", "utc_offset": -3},
+    {"name": "UK", "cc": "GB", "state": "", "utc_offset": 0},
+    {"name": "Brazil", "cc": "BR", "state": "", "utc_offset": -3},
     {"name": "US-East", "cc": "US", "state": "NY", "utc_offset": -5},
     {"name": "US-Central", "cc": "US", "state": "TX", "utc_offset": -6},
     {"name": "US-West", "cc": "US", "state": "CA", "utc_offset": -8},
@@ -58,150 +57,108 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ==================== PEAK REGION FINDER ====================
-class PeakFinder:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.cache = None
-        self.cache_time = 0
-    
-    def get_hour(self, utc_offset):
-        """Get current hour in a timezone"""
-        utc_now = datetime.now(timezone.utc)
-        local = utc_now + timedelta(hours=utc_offset)
-        return local.hour
-    
-    def get_peak_regions(self):
-        """Find regions where it's currently 5-8 PM"""
-        with self.lock:
-            now = time.time()
-            if self.cache and now - self.cache_time < 60:
-                return self.cache
-            
-            peak = []
-            for r in REGIONS:
-                hour = self.get_hour(r['utc_offset'])
-                if PEAK_START <= hour < PEAK_END:
-                    peak.append(r)
-            
-            self.cache = peak
-            self.cache_time = now
-            
-            if peak:
-                names = [r['name'] for r in peak]
-                log.info(f"[PEAK REGIONS] {', '.join(names)}")
-            
-            return peak
-    
-    def get_status(self):
-        """Get all regions with their current hour"""
-        status = []
-        for r in REGIONS:
-            hour = self.get_hour(r['utc_offset'])
-            is_peak = PEAK_START <= hour < PEAK_END
-            status.append({
-                'name': r['name'],
-                'country': r['cc'],
-                'local_hour': hour,
-                'local_time': f"{hour}:00",
-                'is_peak': is_peak
-            })
-        return status
+# ==================== PEAK FINDER ====================
+def get_hour(offset):
+    utc = datetime.now(timezone.utc)
+    return (utc + timedelta(hours=offset)).hour
 
-peak_finder = PeakFinder()
+def get_peak_regions():
+    return [r for r in REGIONS if PEAK_START <= get_hour(r['utc_offset']) < PEAK_END]
 
-# ==================== NAPROXY POOL ====================
+def get_all_status():
+    return [
+        {
+            'name': r['name'],
+            'hour': get_hour(r['utc_offset']),
+            'is_peak': PEAK_START <= get_hour(r['utc_offset']) < PEAK_END
+        }
+        for r in REGIONS
+    ]
+
+# ==================== PROXY POOL ====================
 class ProxyPool:
     def __init__(self):
         self.lock = threading.Lock()
         self.proxies = deque()
-        self.current_region = "Starting..."
-        self.stats = {
-            'api_calls': 0,
-            'ips_fetched': 0,
-            'ips_used': 0,
-            'success': 0,
-            'errors': 0,
-            'by_region': {}
-        }
+        self.region = "Starting"
+        self.stats = {'fetched': 0, 'used': 0, 'success': 0, 'errors': 0, 'api_errors': 0}
+        self.last_error = None
         
-        self.running = True
-        threading.Thread(target=self._refresh_loop, daemon=True).start()
+        threading.Thread(target=self._loop, daemon=True).start()
+    
+    def _build_url(self, region=None):
+        """Build NAProxy URL"""
+        url = f"{NAPROXY_BASE}?app_key={NAPROXY_KEY}&pt=9&ep=&num={PROXY_COUNT}"
+        
+        if region:
+            url += f"&cc={region.get('cc', '')}&state={region.get('state', '')}"
+        else:
+            url += "&cc=&state="
+        
+        url += f"&city=&life={PROXY_LIFE}&protocol=1&format=txt&lb=%5Cr%5Cn"
+        
+        return url
     
     def _fetch(self, region=None):
-        """Fetch proxies from NAProxy API"""
+        """Fetch proxies from NAProxy"""
+        name = region['name'] if region else 'Any'
+        
         try:
-            params = {
-                'app_key': NAPROXY_API_KEY,
-                'pt': 9,
-                'num': PROXY_COUNT,
-                'life': PROXY_LIFE,
-                'protocol': 1,
-                'format': 'txt',
-                'lb': '%5Cr%5Cn'
-            }
+            url = self._build_url(region)
+            resp = requests.get(url, timeout=15)
+            text = resp.text.strip()
             
-            # Set region
-            if region:
-                params['cc'] = region.get('cc', '')
-                params['state'] = region.get('state', '')
-                region_name = region['name']
-            else:
-                params['cc'] = ''
-                params['state'] = ''
-                region_name = 'Any'
+            if 'allow list' in text.lower() or 'whitelist' in text.lower():
+                self.last_error = "IP not whitelisted"
+                log.error(f"[NAPROXY] {self.last_error}")
+                return 0
             
-            params['city'] = ''
-            params['ep'] = ''
+            if text.startswith('{') or 'error' in text.lower():
+                self.last_error = f"API Error: {text[:80]}"
+                log.warning(f"[NAPROXY] {self.last_error}")
+                return 0
             
-            resp = requests.get(NAPROXY_API_URL, params=params, timeout=10)
+            if not text or ':' not in text:
+                self.last_error = "Empty response"
+                return 0
             
-            if resp.ok:
-                text = resp.text.strip()
+            # Parse IPs - format is ip:port
+            lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+            expire = time.time() + PROXY_LIFE
+            count = 0
+            
+            with self.lock:
+                for line in lines:
+                    line = line.strip()
+                    if line and ':' in line and not line.startswith('{'):
+                        # Use SOCKS5 protocol since protocol=1
+                        proxy_url = f"socks5://{line}"
+                        self.proxies.append((proxy_url, expire))
+                        count += 1
                 
-                # Check for error response
-                if not text or text.startswith('{') or 'error' in text.lower() or 'fail' in text.lower():
-                    log.warning(f"[NAPROXY] Bad response: {text[:80]}")
-                    return 0
-                
-                lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-                expire = time.time() + PROXY_LIFE
-                count = 0
-                
-                with self.lock:
-                    for line in lines:
-                        line = line.strip()
-                        if line and ':' in line:
-                            self.proxies.append((f"http://{line}", expire))
-                            count += 1
-                    
-                    self.stats['api_calls'] += 1
-                    self.stats['ips_fetched'] += count
-                    self.current_region = region_name
-                    
-                    if region_name not in self.stats['by_region']:
-                        self.stats['by_region'][region_name] = 0
-                    self.stats['by_region'][region_name] += count
-                
-                log.info(f"[NAPROXY] +{count} IPs from {region_name} (pool: {len(self.proxies)})")
-                return count
-            else:
-                log.error(f"[NAPROXY] HTTP {resp.status_code}")
-                
+                if count > 0:
+                    self.stats['fetched'] += count
+                    self.region = name
+                    self.last_error = None
+            
+            if count > 0:
+                log.info(f"[NAPROXY] +{count} IPs from {name} (pool: {len(self.proxies)})")
+            
+            return count
+            
         except Exception as e:
-            log.error(f"[NAPROXY] Error: {e}")
+            self.last_error = f"Error: {e}"
+            log.error(f"[NAPROXY] {self.last_error}")
         
         return 0
     
     def _cleanup(self):
-        """Remove expired proxies"""
         now = time.time()
         with self.lock:
             self.proxies = deque(p for p in self.proxies if p[1] > now)
     
-    def _refresh_loop(self):
-        """Keep pool fresh with peak region IPs"""
-        while self.running:
+    def _loop(self):
+        while True:
             try:
                 self._cleanup()
                 
@@ -209,46 +166,35 @@ class ProxyPool:
                     size = len(self.proxies)
                 
                 if size < MIN_PROXIES:
-                    peak = peak_finder.get_peak_regions()
-                    
-                    if peak:
-                        # Pick random peak region
-                        region = random.choice(peak)
-                        self._fetch(region)
-                    else:
-                        # No peak - rotate through all
-                        region = random.choice(REGIONS)
-                        self._fetch(region)
+                    peak = get_peak_regions()
+                    region = random.choice(peak) if peak else random.choice(REGIONS)
+                    self._fetch(region)
                 
                 time.sleep(5)
-                
             except Exception as e:
-                log.error(f"[POOL] Error: {e}")
+                log.error(f"[POOL] {e}")
                 time.sleep(2)
     
     def get(self):
-        """Get a proxy"""
         self._cleanup()
         
         with self.lock:
             if self.proxies:
                 idx = random.randint(0, len(self.proxies) - 1)
-                url, expire = self.proxies[idx]
-                if expire - time.time() > 5:
-                    self.stats['ips_used'] += 1
+                url, exp = self.proxies[idx]
+                if exp - time.time() > 5:
+                    self.stats['used'] += 1
+                    # Return both http and https pointing to socks5
                     return {'http': url, 'https': url}, url
         
         # Need more
-        peak = peak_finder.get_peak_regions()
-        if peak:
-            self._fetch(random.choice(peak))
-        else:
-            self._fetch(random.choice(REGIONS))
+        peak = get_peak_regions()
+        self._fetch(random.choice(peak) if peak else random.choice(REGIONS))
         
         with self.lock:
             if self.proxies:
                 url, _ = self.proxies[0]
-                self.stats['ips_used'] += 1
+                self.stats['used'] += 1
                 return {'http': url, 'https': url}, url
         
         return None, None
@@ -268,12 +214,12 @@ class ProxyPool:
             total = self.stats['success'] + self.stats['errors']
             return {
                 'pool_size': len(self.proxies),
-                'current_region': self.current_region,
-                'api_calls': self.stats['api_calls'],
-                'ips_fetched': self.stats['ips_fetched'],
-                'ips_used': self.stats['ips_used'],
+                'current_region': self.region,
+                'fetched': self.stats['fetched'],
+                'used': self.stats['used'],
                 'success_rate': round(self.stats['success'] / max(1, total) * 100, 1),
-                'by_region': self.stats['by_region']
+                'api_errors': self.stats['api_errors'],
+                'last_error': self.last_error
             }
 
 proxy_pool = ProxyPool()
@@ -290,18 +236,15 @@ class ServerPool:
     def _cleanup(self):
         now = time.time()
         
-        # Clean dead
         old = [k for k, v in self._dead.items() if now - v > 600]
         for k in old:
             del self._dead[k]
         
-        # Recycle assigned
         expired = [(k, v) for k, v in self._assigned.items() if now - v > GIVEN_TTL]
         for job_id, _ in expired:
             del self._assigned[job_id]
             self._stats['recycled'] += 1
         
-        # Clean available
         old = [k for k, (p, t, pr) in self._available.items() if now - t > SERVER_TTL]
         for k in old:
             del self._available[k]
@@ -341,12 +284,7 @@ class ServerPool:
             if not self._available:
                 return None
             
-            # Sort by priority
-            sorted_servers = sorted(
-                self._available.items(),
-                key=lambda x: x[1][2],
-                reverse=True
-            )
+            sorted_servers = sorted(self._available.items(), key=lambda x: x[1][2], reverse=True)
             
             for job_id, (players, added_time, priority) in sorted_servers:
                 if job_id in self._dead:
@@ -356,11 +294,7 @@ class ServerPool:
                 self._assigned[job_id] = time.time()
                 self._stats['total_given'] += 1
                 
-                return {
-                    'job_id': job_id,
-                    'players': players,
-                    'pool_size': len(self._available)
-                }
+                return {'job_id': job_id, 'players': players, 'pool_size': len(self._available)}
             
             return None
     
@@ -393,8 +327,7 @@ class ServerPool:
                 'assigned': len(self._assigned),
                 'dead': len(self._dead),
                 'total_given': self._stats['total_given'],
-                'total_received': self._stats['total_received'],
-                'recycled': self._stats['recycled']
+                'total_received': self._stats['total_received']
             }
 
 pool = ServerPool()
@@ -407,6 +340,7 @@ class Fetcher:
         self.lock = threading.Lock()
         self.servers_min = 0
         self.last_log = time.time()
+        self.fetch_errors = 0
     
     def fetch_page(self, cursor=None, sort='Asc'):
         proxy, url = proxy_pool.get()
@@ -414,18 +348,13 @@ class Fetcher:
             return [], None
         
         try:
+            params = {'sortOrder': sort, 'limit': SERVERS_PER_REQUEST, 'excludeFullGames': 'true'}
+            if cursor:
+                params['cursor'] = cursor
+            
             resp = requests.get(
                 f"https://games.roblox.com/v1/games/{PLACE_ID}/servers/Public",
-                params={
-                    'sortOrder': sort,
-                    'limit': SERVERS_PER_REQUEST,
-                    'excludeFullGames': 'true',
-                    'cursor': cursor
-                } if cursor else {
-                    'sortOrder': sort,
-                    'limit': SERVERS_PER_REQUEST,
-                    'excludeFullGames': 'true'
-                },
+                params=params,
                 proxies=proxy,
                 timeout=15,
                 headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -437,11 +366,15 @@ class Fetcher:
                 return data.get('data', []), data.get('nextPageCursor')
             else:
                 proxy_pool.error(url)
-                return [], None
-                
-        except:
+                self.fetch_errors += 1
+        except Exception as e:
             proxy_pool.error(url)
-            return [], None
+            self.fetch_errors += 1
+            # Log first few errors to debug
+            if self.fetch_errors <= 5:
+                log.error(f"[FETCH] Error: {e}")
+        
+        return [], None
     
     def cycle(self):
         fetches = [(None, 'Asc'), (None, 'Desc')]
@@ -466,10 +399,7 @@ class Fetcher:
                     if servers:
                         added += pool.add(servers)
                     if cursor:
-                        if futures[f] == 'Asc':
-                            new_asc.append(cursor)
-                        else:
-                            new_desc.append(cursor)
+                        (new_asc if futures[f] == 'Asc' else new_desc).append(cursor)
                 except:
                     pass
         
@@ -479,20 +409,26 @@ class Fetcher:
         
         self.servers_min += added
         
-        # Log every minute
         if time.time() - self.last_log >= 60:
             stats = pool.stats()
             pstats = proxy_pool.get_stats()
-            peak = peak_finder.get_peak_regions()
+            peak = get_peak_regions()
             regions = [r['name'] for r in peak] if peak else ['Rotating']
             
             log.info(f"[{', '.join(regions)}] +{self.servers_min}/min | Avail: {stats['available']} | Given: {stats['total_given']} | Proxies: {pstats['pool_size']} | {pstats['success_rate']}%")
+            
+            if pstats['last_error']:
+                log.warning(f"[PROXY] {pstats['last_error']}")
+            
+            if self.fetch_errors > 0:
+                log.warning(f"[FETCH] {self.fetch_errors} errors this minute")
+                self.fetch_errors = 0
             
             self.servers_min = 0
             self.last_log = time.time()
     
     def run(self):
-        log.info("[FETCHER] Started - UK/Brazil/US Peak Rotation")
+        log.info("[FETCHER] Started - UK/Brazil/US rotation")
         while True:
             try:
                 self.cycle()
@@ -504,14 +440,14 @@ class Fetcher:
 fetcher = Fetcher()
 
 # ==================== ENDPOINTS ====================
-
 @app.route('/status', methods=['GET'])
 def status():
+    peak = get_peak_regions()
     return jsonify({
         'servers': pool.stats(),
         'proxy': proxy_pool.get_stats(),
-        'regions': peak_finder.get_status(),
-        'peak_regions': [r['name'] for r in peak_finder.get_peak_regions()] or ['Rotating all']
+        'regions': get_all_status(),
+        'peak_now': [r['name'] for r in peak] if peak else ['Rotating']
     })
 
 @app.route('/get-server', methods=['GET'])
@@ -530,8 +466,7 @@ def get_batch():
 @app.route('/add-pool', methods=['POST'])
 def add_pool():
     data = request.get_json() or {}
-    servers = data.get('servers', [])
-    added = pool.add(servers) if servers else 0
+    added = pool.add(data.get('servers', []))
     return jsonify({'added': added, 'available': pool.count()})
 
 @app.route('/report-dead', methods=['POST'])
@@ -543,41 +478,36 @@ def report_dead():
 
 @app.route('/health', methods=['GET'])
 def health():
-    peak = peak_finder.get_peak_regions()
+    pstats = proxy_pool.get_stats()
     return jsonify({
         'status': 'ok',
         'available': pool.count(),
-        'proxies': proxy_pool.get_stats()['pool_size'],
-        'peak_regions': [r['name'] for r in peak] if peak else ['Rotating']
+        'proxies': pstats['pool_size'],
+        'proxy_error': pstats['last_error']
     })
 
 @app.route('/regions', methods=['GET'])
 def regions():
-    return jsonify({
-        'status': peak_finder.get_status(),
-        'peak_now': [r['name'] for r in peak_finder.get_peak_regions()] or ['None']
-    })
+    return jsonify({'regions': get_all_status()})
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     
     log.info(f"[STARTUP] Main API on port {port}")
-    log.info(f"[CONFIG] Regions: UK, Brazil, US (East/Central/West)")
-    log.info(f"[CONFIG] Peak hours: {PEAK_START}:00-{PEAK_END}:00 local time")
+    log.info(f"[CONFIG] Regions: UK, Brazil, US")
+    log.info(f"[CONFIG] Using SOCKS5 proxies")
     
-    # Show current status
-    for r in peak_finder.get_status():
-        status = "🟢 PEAK" if r['is_peak'] else "⚪"
-        log.info(f"  {r['name']}: {r['local_time']} {status}")
+    # Show status
+    log.info("[REGIONS]")
+    for r in get_all_status():
+        status = "🟢 PEAK" if r['is_peak'] else ""
+        log.info(f"  {r['name']}: {r['hour']}:00 {status}")
     
-    # Pre-fetch proxies
+    # Fetch initial proxies
     log.info("[NAPROXY] Fetching initial proxies...")
-    peak = peak_finder.get_peak_regions()
-    if peak:
-        proxy_pool._fetch(random.choice(peak))
-    else:
-        proxy_pool._fetch(random.choice(REGIONS))
+    peak = get_peak_regions()
+    proxy_pool._fetch(random.choice(peak) if peak else random.choice(REGIONS))
     
     # Start fetcher
     threading.Thread(target=fetcher.run, daemon=True).start()
